@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 ###############################################################################
-#  RunPod Gaming Rig v13 — Pathfinder: WotR
-#  NVIDIA L4 | Ubuntu 22.04 | Sunshine → Moonlight | 4K@144Hz
+#  RunPod Gaming Rig v14 — Pathfinder: WotR
+#  NVIDIA A5000/L4 | Ubuntu 22.04 | Sunshine → Moonlight | 4K@144Hz
+#  KNOWN: RunPod blocks inbound UDP — Tailscale stays on DERP relay
+#  REQUIREMENT: Use provider with open UDP (Vast.ai, Lambda, etc.)
 ###############################################################################
 
 mkdir -p /workspace/gaming-logs
@@ -120,6 +122,33 @@ for pkg in \
     apt-get install -y --no-install-recommends "$pkg" 2>/dev/null \
         || warn "optional dep $pkg not available — skipping"
 done
+
+# Fix libstdc++ — old version causes Sunshine segfault mid-stream
+# Install conda-forge libstdc++ 6.0.33+
+if python3 -c "import ctypes; ctypes.CDLL('libstdc++.so.6')" 2>/dev/null; then
+    STDCXX_VER=$(strings $(ldconfig -p | grep 'libstdc++.so.6' | awk '{print $NF}' | head -1) 2>/dev/null | grep 'GLIBCXX_' | sort -V | tail -1 || echo "unknown")
+    log "libstdc++ GLIBCXX max: $STDCXX_VER"
+fi
+# Install conda if not present and use it for libstdc++
+if ! command -v conda &>/dev/null; then
+    log "Installing miniconda for libstdc++ fix..."
+    curl -fsSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -o /tmp/miniconda.sh
+    bash /tmp/miniconda.sh -b -p /opt/conda 2>/dev/null
+    rm -f /tmp/miniconda.sh
+    export PATH="/opt/conda/bin:$PATH"
+fi
+export PATH="/opt/conda/bin:$PATH"
+conda install -y -c conda-forge libstdcxx-ng 2>/dev/null || warn "conda libstdcxx-ng install failed"
+# Symlink conda's libstdc++ over system one
+CONDA_STDCXX=$(find /opt/conda -name 'libstdc++.so.6.*' 2>/dev/null | sort -V | tail -1 || true)
+if [ -n "$CONDA_STDCXX" ]; then
+    cp -f "$CONDA_STDCXX" /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+    ldconfig
+    log "libstdc++ updated from conda: $CONDA_STDCXX"
+else
+    warn "conda libstdc++ not found — segfault risk remains"
+fi
+
 ldconfig 2>/dev/null || true
 
 CRITICAL_SO_OK=true
@@ -217,6 +246,8 @@ fi
 mkdir -p /root/.config/sunshine
 echo '{}' > /root/.config/sunshine/sunshine_state.json
 
+# hevc_mode=1 = 8-bit only. Disables 10-bit HEVC path that triggers
+# cuda_t AV_PIX_FMT_NV12 assertion → segfault mid-stream (confirmed session 4)
 cat > /root/.config/sunshine/sunshine.conf << SUNEOF
 port                  = 47989
 upnp                  = off
@@ -224,6 +255,9 @@ origin_web_ui_allowed = pc
 address_family        = ipv4
 capture               = x11
 encoder               = nvenc
+hevc_register         = true
+hevc_mode             = 1
+min_threads           = 2
 adapter_name          = ${DRI_RENDER}
 output_name           = 0
 resolutions           = [3840x2160, 2560x1440, 1920x1080]
@@ -236,11 +270,29 @@ SUNEOF
     || warn "sunshine --creds failed — use web UI at https://127.0.0.1:47990"
 
 ###############################################################################
-hdr "6 — GAME ASSETS (WotR)"
+hdr "6 — TAILSCALE"
+###############################################################################
+if ! command -v tailscale &>/dev/null; then
+    curl -fsSL https://tailscale.com/install.sh | sh 2>/dev/null || warn "Tailscale install failed"
+fi
+if command -v tailscale &>/dev/null; then
+    # Start tailscaled if not running
+    if ! pgrep tailscaled &>/dev/null; then
+        tailscaled --tun=userspace-networking --socks5-server=localhost:1055 \
+            > /workspace/gaming-logs/tailscale.log 2>&1 &
+        sleep 3
+    fi
+    log "Tailscale daemon running"
+    log "Run: tailscale up --authkey=<YOUR_KEY> to connect"
+else
+    warn "Tailscale not available"
+fi
+
+###############################################################################
+hdr "7 — GAME ASSETS (WotR)"
 ###############################################################################
 mkdir -p "$WOTR_SAVES" "$WOTR_SAVES_PROTON" "$WOTR_MODS" "$LOG_DIR"
 
-# Copy any .save files staged in /workspace (e.g. from RunPod file browser upload)
 SC=0
 while IFS= read -r -d '' f; do
     cp -n "$f" "$WOTR_SAVES/" 2>/dev/null || true
@@ -250,7 +302,7 @@ done < <(find /workspace -maxdepth 4 -name "*.save" -print0 2>/dev/null)
 log "Workspace .save files staged: $SC"
 
 ###############################################################################
-hdr "7 — B2 SYNC (WotR saves)"
+hdr "8 — B2 SYNC (WotR saves)"
 ###############################################################################
 if [ -n "$B2_KEY_ID" ] && [ -n "$B2_APP_KEY" ]; then
     command -v rclone &>/dev/null || curl -fsSL https://rclone.org/install.sh | bash 2>/dev/null || true
@@ -267,13 +319,11 @@ acl = private
 no_check_bucket = true
 RCONF
 
-    # Pull latest saves from B2 on pod start
     rclone copy "b2:${B2_BUCKET}/wotr/saves/" "$WOTR_SAVES/" --update 2>/dev/null \
         && log "B2 saves pulled → $WOTR_SAVES" \
         || warn "B2 saves pull empty or failed"
     rclone copy "b2:${B2_BUCKET}/wotr/saves/" "$WOTR_SAVES_PROTON/" --update 2>/dev/null || true
 
-    # Sync script
     cat > /usr/local/bin/wotr-b2-sync.sh << SYNCEOF
 #!/usr/bin/env bash
 rclone sync "${WOTR_SAVES}/" "b2:${B2_BUCKET}/wotr/saves/" \
@@ -281,7 +331,6 @@ rclone sync "${WOTR_SAVES}/" "b2:${B2_BUCKET}/wotr/saves/" \
 SYNCEOF
     chmod +x /usr/local/bin/wotr-b2-sync.sh
 
-    # Cron: every 5 min
     (crontab -l 2>/dev/null | grep -v wotr-b2-sync; echo "*/5 * * * * /usr/local/bin/wotr-b2-sync.sh") | crontab - 2>/dev/null || true
     log "B2 configured — syncing WotR saves every 5 min"
 else
@@ -289,7 +338,7 @@ else
 fi
 
 ###############################################################################
-hdr "8 — PULSEAUDIO"
+hdr "9 — PULSEAUDIO"
 ###############################################################################
 pulseaudio --kill 2>/dev/null || true
 sleep 1
@@ -300,7 +349,7 @@ pactl set-default-sink virtual_out 2>/dev/null || true
 log "PulseAudio virtual sink ready"
 
 ###############################################################################
-hdr "9 — SUPERVISOR"
+hdr "10 — SUPERVISOR"
 ###############################################################################
 mkdir -p /run/user/0; chmod 700 /run/user/0
 
@@ -381,7 +430,7 @@ environment=DISPLAY=":${DISPLAY_NUM}",HOME="/root",XDG_RUNTIME_DIR="/run/user/0"
 SSEOF
 
 ###############################################################################
-hdr "10 — LAUNCH"
+hdr "11 — LAUNCH"
 ###############################################################################
 nohup "$SUPD" -c /etc/supervisor/supervisord.conf >> "${LOG_DIR}/supervisord-boot.log" 2>&1 &
 disown
@@ -391,7 +440,7 @@ sleep 20
 supervisorctl -c /etc/supervisor/supervisord.conf status 2>/dev/null | sed 's/^/  /' || warn "supervisorctl not responding yet"
 
 ###############################################################################
-hdr "11 — VERIFY"
+hdr "12 — VERIFY"
 ###############################################################################
 PASS=0; FAIL=0
 chk() {
@@ -415,7 +464,7 @@ echo "  GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>
 echo "  Result: ${PASS} passed / ${FAIL} failed"
 
 ###############################################################################
-hdr "12 — GENERATE connect.bat"
+hdr "13 — GENERATE connect.bat"
 ###############################################################################
 PUBIP=$(curl -s --max-time 5 ifconfig.me 2>/dev/null || curl -s --max-time 5 api.ipify.org 2>/dev/null || echo "UNKNOWN")
 SSH_PORT="${RUNPOD_TCP_PORT_22:-22}"
@@ -478,7 +527,7 @@ log "connect.bat written → /workspace/connect.bat"
 ###############################################################################
 echo ""
 echo "==========================================="
-echo " RunPod Gaming Rig v13 (WotR) — ${SECONDS}s"
+echo " RunPod Gaming Rig v14 (WotR) — ${SECONDS}s"
 echo "==========================================="
 echo ""
 echo " scp -P ${SSH_PORT} root@${PUBIP}:/workspace/connect.bat ."
