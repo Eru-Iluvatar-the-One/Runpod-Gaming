@@ -1,73 +1,95 @@
 # ARENA.AI HANDOFF — RunPod Game Streaming via Moonlight/Sunshine
-**Date:** 2026-03-13
-**Trigger Phrase:** "RUNPOD STREAMING HANDOFF — pick up from the UDP tunnel failure. Read this doc fully before responding."
+**Date:** 2026-03-13 (Updated end of Session 2)
+**Trigger Phrase:** "RUNPOD STREAMING HANDOFF — pick up from the UDP tunnel failure. Read BARAHIR/ARENA-HANDOFF-RUNPOD-UDP-2026-03-13.md and BARAHIR/SESSION-2-VIOLATIONS-2026-03-13.md fully before responding."
 
 ---
 
 ## PROBLEM STATEMENT
 Stream games from a RunPod GPU pod (RTX A5000) to a Windows 10 LTSC PC using Sunshine (server) + Moonlight (client). The core blocker: Moonlight requires UDP ports 47998/47999/48000 but RunPod only exposes TCP ports.
 
-## CURRENT STATE
+## CURRENT STATE (as of Session 2 end)
 - **Pod:** RunPod, RTX A5000, `runpod-torch-v240` template
-- **Pod IP:** `203.57.40.247` (changes on restart)
-- **SSH:** `ssh root@203.57.40.247 -p 10282` (password: `gondolin123`)
+- **Pod IP:** `203.57.40.247` (changes on restart — UPDATE THIS)
+- **SSH:** `ssh root@203.57.40.247 -p 10282`
+- **Auth:** password `gondolin123` OR SSH key if added to RunPod settings
 - **UDP outbound FROM pod works:** `bash -c 'echo "test" > /dev/udp/8.8.8.8/53'` returns OK
 - **UDP inbound TO pod is blocked:** RunPod only proxies TCP via their `Direct TCP ports` feature
-- **Sunshine:** NOT confirmed installed on this new pod instance
-- **Moonlight:** Installed on Windows PC. Settings screenshot shows NO "Force TCP" option exists in this version.
+- **Sunshine:** NOT confirmed installed on current pod instance
+- **Moonlight version on PC:** Does NOT have "Force TCP" option
 
-## WHAT FAILED (DO NOT REPEAT)
-1. **chisel** (TCP-to-UDP tunnel tool) — Windows Defender flags it as `HackTool:Win64/Chisel!MTB`, HIGH threat. User will NOT add Defender exclusions. **DO NOT SUGGEST CHISEL.**
-2. **plink.exe** — password auth failed with "Configured password was not accepted"
-3. **SSH -L for UDP** — `ssh -L` only forwards TCP, not UDP. Moonlight needs UDP. Previous session incorrectly assumed "Force TCP" exists in Moonlight settings — it doesn't.
-4. **Multiple sessions of going in circles** asking user to run diagnostic commands instead of shipping a fix.
+## WHAT FAILED — DO NOT REPEAT THESE
+| # | Approach | Why it failed |
+|---|----------|---------------|
+| 1 | **chisel** (TCP↔UDP tunnel) | Windows Defender flags as `HackTool:Win64/Chisel!MTB` HIGH. User will NOT add exclusions. **BANNED.** |
+| 2 | **plink.exe** password auth | "Configured password was not accepted" |
+| 3 | **SSH -L + "Force TCP" in Moonlight** | `ssh -L` only forwards TCP. Moonlight does NOT have a "Force TCP" toggle. **Feature was hallucinated.** |
+| 4 | **udp2raw / any tool Defender flags** | Same class of problem as chisel. If Defender will flag it, it's dead. |
 
-## CONFIRMED CONSTRAINTS
-- No TUN device (unprivileged container)
-- No CAP_NET_ADMIN
-- No iptables/nftables control
-- Windows Defender ON, no exclusions allowed
-- User wants ONE double-click .bat file, zero manual steps after first-time SSH key setup
-- User SSH key: `%USERPROFILE%\.ssh\id_ed25519` (may need to be generated + added to RunPod)
+## HARD CONSTRAINTS
+- **No TUN device** (unprivileged container)
+- **No CAP_NET_ADMIN**
+- **No iptables/nftables**
+- **Windows Defender ON, zero exclusions allowed**
+- **No hack tools** — if Defender flags it, it's banned
+- **One-click .bat file** — user double-clicks, it works. Zero manual steps after first-time SSH key setup.
+- **User SSH key:** `%USERPROFILE%\.ssh\id_ed25519` (may need generation + RunPod settings)
 
-## VIABLE OPTIONS (NOT YET TRIED)
+## VIABLE OPTIONS (RESEARCH THESE)
+
 ### Option A: RunPod Native UDP Exposure
-- RunPod may support exposing UDP ports natively. Research RunPod docs/API for UDP port exposure.
-- If available, this is the cleanest fix — no tunneling needed.
+- Does RunPod support exposing UDP ports? Check docs, API, community.
+- If yes → cleanest fix, no tunneling at all.
+- **Priority: HIGH — check this first.**
 
-### Option B: Sunshine's built-in TCP-only mode
-- Sunshine v0.20+ may have a config option to force all traffic over TCP (no UDP needed).
-- Research `sunshine.conf` options: `channels`, `protocol`, or similar.
-- If Sunshine can serve everything over TCP, then plain `ssh -L` tunnels work perfectly.
+### Option B: Sunshine TCP-only mode
+- Sunshine v0.20+ may support streaming over TCP only (no UDP).
+- Check `sunshine.conf` for `protocol`, `channels`, `force_tcp`, or similar.
+- If available → plain `ssh -L` works for everything.
+- **Priority: HIGH.**
 
-### Option C: socat or SSH-based UDP forwarding
-- `socat` can bridge UDP<->TCP without being flagged as a hack tool.
-- Pattern: `socat TCP-LISTEN:X,fork UDP:localhost:Y` on pod, `ssh -L` on client, `socat UDP-LISTEN:Y,fork TCP:localhost:X` on Windows.
-- socat is NOT flagged by Defender (it's a standard Unix utility, and the Windows build is clean).
+### Option C: socat UDP↔TCP bridge
+- `socat` is a standard utility, NOT flagged by Defender.
+- Pattern:
+  - Pod: `socat TCP-LISTEN:X,fork UDP:localhost:47998` (one per UDP port)
+  - Windows SSH: `ssh -L X:localhost:X` (forwards the TCP)
+  - Windows: `socat UDP-LISTEN:47998,fork TCP:localhost:X` (converts back)
+- Need Windows socat build — check if Cygwin socat or standalone .exe is Defender-safe.
+- **Priority: MEDIUM — verify Defender compatibility first.**
 
-### Option D: WireGuard-go / BoringTun (userspace VPN)
-- Userspace WireGuard doesn't need TUN — runs as a process.
-- WireGuard is signed, Defender-friendly, and handles UDP natively.
-- Heavier setup but rock-solid once working.
+### Option D: WireGuard-go / BoringTun userspace VPN
+- Userspace WireGuard, no TUN needed.
+- WireGuard is signed, Defender-friendly.
+- Heavier setup but rock-solid.
+- **Priority: MEDIUM.**
 
-### Option E: Parsec / Alternative to Moonlight
-- Parsec works over TCP natively, no UDP port forwarding needed.
-- Would bypass the entire UDP problem.
-- Tradeoff: different client, may have different latency/quality characteristics.
+### Option E: Parsec instead of Moonlight
+- Parsec works over TCP natively, no UDP port forwarding.
+- Eliminates the entire UDP problem.
+- Different client = different latency/quality tradeoffs.
+- **Priority: MEDIUM — fallback if A-D all fail.**
 
-## QUESTIONS FOR ARENA.AI SESSION
-1. Does Sunshine have a TCP-only streaming mode? Check latest Sunshine docs/GitHub for `sunshine.conf` TCP options.
-2. Does RunPod support exposing UDP ports? Check RunPod docs, API, and community forums.
-3. Can `socat` on Windows (from the official Cygwin or standalone build) tunnel UDP<->TCP without Defender flags?
-4. Is `boringtun` (Cloudflare's userspace WireGuard) viable in an unprivileged RunPod container?
-5. Would switching to Parsec eliminate the problem entirely?
+## QUESTIONS TO ANSWER
+1. Does RunPod expose UDP ports? (Check runpod.io docs, API reference, community/Discord)
+2. Does Sunshine have TCP-only streaming? (Check LizardByte/Sunshine GitHub, sunshine.conf docs)
+3. Is socat.exe flagged by Windows Defender? (Test or research)
+4. Can boringtun run in unprivileged RunPod container?
+5. What's Parsec's latency vs Moonlight for this use case?
 
 ## REPO
-- GitHub: `Eru-Iluvatar-the-One/Runpod-Gaming`
-- Previous session docs committed to `BARAHIR/` directory
+- `Eru-Iluvatar-the-One/Runpod-Gaming`
+- Violations log: `BARAHIR/SESSION-2-VIOLATIONS-2026-03-13.md`
+
+## DELIVERABLE
+A single `connect.bat` that the user saves to `C:\Users\Eru\connect.bat`, points a shortcut at, and double-clicks. It must:
+1. Work with zero third-party downloads that Defender would flag
+2. SSH into pod, start Sunshine
+3. Establish whatever tunnel/bridge is needed
+4. Launch Moonlight configured to connect
+5. Require password/key entry at most ONCE
 
 ## USER PREFERENCES
-- One-click .bat file, zero third-party hack tools
-- No Defender exclusions
-- No multi-step instructions — ship runnable code
-- Aggressive, impatient, wants execution not explanation
+- Ship code, not explanations
+- One file, one click, one command
+- Find the ONE root cause, not 10 possibilities
+- Do not come back without a working solution
+- Aggressive communicator — wants execution, not discussion
