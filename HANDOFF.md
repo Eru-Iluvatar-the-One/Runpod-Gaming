@@ -1,70 +1,97 @@
 # HANDOFF — Runpod-Gaming
-_Trigger phrase: `BARAHIR HANDOFF runpod-gaming`_
+_Trigger: `BARAHIR HANDOFF runpod-gaming`_
 
 ## Identity
 Station IV. MCP active: filesystem, github, memory. Win10 LTSC client.
 
-## Pod State
-- Host: `66.92.198.162` port `11193`
-- SSH relay: `ssh by8x28h0ciubu7-64411dcc@ssh.runpod.io`
-- GPU: NVIDIA L4, BusID `PCI:0:36:0`, driver `570`
+## Pod
+- Host: `66.92.198.162` SSH port `11193`
+- GPU: NVIDIA L4, 23034 MiB, driver 570
+- BusID: `PCI:36:0:0`
 - Image: `runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04`
-- Persistent volume: 150GB at `/workspace`
-- Container: 75GB, 16 vCPU, 94GB RAM
-- Pod ID: `by8x28h0ciubu7`, name: `respective_amber_rhinoceros`
+- Persistent: 150GB `/workspace`
+- Pod ID: `by8x28h0ciubu7`
 
 ## Repo
-`https://github.com/Eru-Iluvatar-the-One/Runpod-Gaming` (public)
-One file: `setup.sh`
+`https://github.com/Eru-Iluvatar-the-One/Runpod-Gaming`
+Single file: `setup.sh`
 
-## Goal
-One-shot bash script: Xorg headless + Sunshine + supervisord → Moonlight streaming 4K@144Hz.
-Game: Total War: Three Kingdoms (Steam 779340, Feral port).
-Save sync: Backblaze B2 bucket `Funfun` via rclone.
-
-## Script Status: v6 — PUSHED, UNTESTED
-
-**Run command (python3 always exists in image):**
+## Run command (always use this)
 ```bash
 python3 -c "import urllib.request; open('/tmp/s.sh','wb').write(urllib.request.urlopen('https://raw.githubusercontent.com/Eru-Iluvatar-the-One/Runpod-Gaming/main/setup.sh').read())" && /bin/bash /tmp/s.sh
 ```
 
-**v6 fix:** Added step 0 — `apt-get install -y curl wget 2>/dev/null || true` before any downloads.
+## Current status: v8 ran, 2/7 passed. TWO BUGS REMAIN.
 
-## Script Config Values
-- `ROOT_PASS=gondolin123`
-- `DISP=:99`
-- `LOG_DIR=/workspace/gaming-logs`
-- `PKG_CACHE=/tmp/rp_pkgs`
-- Sunshine v0.23.1, ubuntu-22.04-amd64.deb
-- supervisord pidfile `/tmp/supervisord.pid`, socket `/tmp/supervisor.sock`
-- Sunshine port 47989, web UI 47990
-- B2: bucket `Funfun`, endpoint `s3.us-east-005.backblazeb2.com`, rclone remote `b2funfun`
-- B2 env vars: `B2_KEY_ID`, `B2_APP_KEY` (user sets before running)
-
-## Feral/Proton Paths
-- Saves: `/root/.local/share/feral-interactive/Total War THREE KINGDOMS/User Data/Save Games`
-- Packs: `/root/.local/share/feral-interactive/Total War THREE KINGDOMS/User Data/packs`
-- Proton: `/root/.steam/steam/steamapps/compatdata/779340/pfx/drive_c/users/steamuser/Documents/My Games/Total War THREE KINGDOMS`
-
-## PowerShell Tunnel (Win10 LTSC)
-```powershell
-ssh -N -L 47984:localhost:47984 -L 47989:localhost:47989 `
-   -L 47990:localhost:47990 -L 48010:localhost:48010 `
-   root@66.92.198.162 -p 11193 -o StrictHostKeyChecking=no `
-   -o ServerAliveInterval=60 -o ServerAliveCountMax=10
+### Bug 1 — Wrong /dev/dri device paths (CRITICAL)
+xorg.conf hardcodes `card0` / `renderD128`.
+Actual nodes on this pod:
 ```
-Then Moonlight → Add PC → `127.0.0.1`
-Note: UDP 47998-48000 needed for video — consider Tailscale or force Moonlight TCP.
+/dev/dri/card4        ← real card
+/dev/dri/renderD131   ← real render node
+```
+`mknod` is denied (not privileged). Must auto-detect actual paths.
 
-## Bug History
-- v1: `[[ ]] && exec sudo` + `set -e` = silent exit
-- v2: LOG_DIR=/var/log (read-only in RunPod)
-- v3: `exec &> >(tee ...)` dies silently in `bash <(wget)` context
-- v4: wget doesn't exist in image
-- v5: curl doesn't exist, bash not at /usr/bin/bash
-- v6: fixed — apt-get installs curl/wget as step 0; python3 used to fetch script
+Fix: at runtime, detect `card*` and `renderD*` under `/dev/dri/` and use those.
+```bash
+DRI_CARD=$(ls /dev/dri/card* 2>/dev/null | head -1)
+DRI_RENDER=$(ls /dev/dri/renderD* 2>/dev/null | head -1)
+```
+Use `$DRI_RENDER` in sunshine.conf `adapter_name`.
+Xorg nvidia driver uses its own `/dev/nvidia*` path — but modesetting fallback
+was trying `card0` which doesn't exist → "no screens found".
 
-## Next Action
-Run v6 via python3 command above. Verify: Xorg OK, Sunshine OK, web UI reachable.
-Then: SSH tunnel from Win10, Moonlight pair, launch game.
+### Bug 2 — Sunshine missing libayatana-appindicator3.so.1
+```
+/usr/bin/sunshine: error while loading shared libraries: libayatana-appindicator3.so.1
+```
+Fix: `apt-get install -y libayatana-appindicator3-1` (or safe_install it).
+This is a normal apt package, no EXDEV expected.
+
+### Bug 3 — NVIDIA kernel module init failure in Xorg
+```
+(EE) NVIDIA: Failed to initialize the NVIDIA kernel module.
+```
+`/dev/nvidia3`, `/dev/nvidiactl`, `/dev/nvidia-modeset` all exist.
+Likely cause: xorg nvidia DDX can't open the device because it's looking
+for GPU index 0 but container sees it as index 3. Try adding to xorg.conf Device section:
+```
+Option "NVidiaCTL" "/dev/nvidiactl"
+```
+Or force modesetting driver (bypasses NVIDIA DDX entirely):
+- Change Driver from "nvidia" to "modesetting"
+- Use `card4` explicitly
+- Sunshine x11 capture still works with modesetting
+
+## What v9 must do
+1. `apt-get install -y libayatana-appindicator3-1` early in packages phase
+2. Auto-detect DRI nodes at runtime, use actual paths
+3. Try nvidia driver first; if Xorg log shows "Failed to initialize NVIDIA kernel module",
+   fall back to modesetting driver with detected card path
+4. Set `adapter_name = $DRI_RENDER` (detected) in sunshine.conf
+5. All other v8 logic stays (staged Sunshine extraction, pip supervisord, etc.)
+
+## Bug history
+- v1: `set -e` + exec sudo = silent exit
+- v2: LOG_DIR=/var/log (read-only)
+- v3: `exec &> >(tee ...)` silent death in bash <(wget) context
+- v4: wget not in image
+- v5: curl not in image, bash not at /usr/bin/bash
+- v6: added curl/wget step 0
+- v7: dpkg-deb -x sunshine.deb / clobbered /bin/sh + coreutils
+- v8: staged extraction fixed clobber; but wrong DRI paths + missing libayatana
+
+## PowerShell tunnel (Win10 LTSC)
+```powershell
+ssh -N `
+  -L 47984:localhost:47984 `
+  -L 47989:localhost:47989 `
+  -L 47990:localhost:47990 `
+  -L 48010:localhost:48010 `
+  root@66.92.198.162 -p 11193 -o StrictHostKeyChecking=no
+```
+Moonlight → Add PC → 127.0.0.1
+Web UI → https://127.0.0.1:47990 (admin / gondolin123)
+
+## Next action
+Push v9 to repo. Run via python3 command above.
