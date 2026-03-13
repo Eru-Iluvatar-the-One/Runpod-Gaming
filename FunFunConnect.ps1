@@ -6,13 +6,13 @@ $ErrorActionPreference = "Stop"
 
 try {
     $host.UI.RawUI.WindowTitle = "FunFunPod"
-    $POD_ID  = "lu82dw2kr8nuuj"
+    $POD_ID  = "fna668y0lkmimr"
     $EMAIL   = "eruilu22@gmail.com"
     $SSHKEY  = "$env:USERPROFILE\.ssh\id_ed25519"
     $CACHE   = "$env:USERPROFILE\.funfunpod_cache.json"
     $WOTR    = "$env:USERPROFILE\AppData\LocalLow\Owlcat Games\Pathfinder Wrath Of The Righteous\Saved Games"
-    $KNOWN_IP   = "69.30.85.244"
-    $KNOWN_PORT = 22060
+    $KNOWN_IP   = "203.57.40.126"
+    $KNOWN_PORT = 10094
 
     function G($n) {
         $v = [Environment]::GetEnvironmentVariable($n,"User")
@@ -75,10 +75,13 @@ try {
 
     Write-Host ">> Pushing setup to ${ip}:${port}..."
     $PW64=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($PW))
-    $bash=@"
+
+    # FIXED: literal here-string prevents PowerShell expanding $B2I/$B2K/$EMAIL inside bash
+    # Values injected via .Replace() tokens
+    $bash=@'
 #!/bin/bash
 set -e
-PW=`$(printf '%s' '$PW64' | base64 -d)
+PW=$(printf '%s' '__PW64__' | base64 -d)
 CFG=/root/.config/parsec/config.cfg
 LOG=/workspace/gaming-logs
 WS="/root/.local/share/unity3d/Owlcat Games/Pathfinder Wrath Of The Righteous/Saved Games"
@@ -86,47 +89,49 @@ WP="/root/.steam/steam/steamapps/compatdata/1184370/pfx/drive_c/users/steamuser/
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq wget xvfb curl jq python3-pip rsync >/dev/null 2>&1
-pip3 install b2 -q >/dev/null 2>&1 || true
 command -v rclone &>/dev/null || (curl -fsSL https://rclone.org/install.sh | bash >/dev/null 2>&1) || true
 mkdir -p /root/.config/rclone
-cat > /root/.config/rclone/rclone.conf << REOF
+cat > /root/.config/rclone/rclone.conf << 'REOF'
 [b2]
 type = s3
 provider = Other
-access_key_id = $B2I
-secret_access_key = $B2K
+access_key_id = __B2I__
+secret_access_key = __B2K__
 endpoint = s3.us-east-005.backblazeb2.com
 acl = private
 no_check_bucket = true
 REOF
-mkdir -p "`$WS" "`$WP" "`$LOG"
-rclone copy b2:FunFun/wotr/saves/ "`$WS/" --update 2>/dev/null || true
-rclone copy b2:FunFun/wotr/saves/ "`$WP/" --update 2>/dev/null || true
-[ -d /tmp/wis ] && rsync -a --update /tmp/wis/ "`$WS/" 2>/dev/null || true
-[ -d /tmp/wis ] && rsync -a --update /tmp/wis/ "`$WP/" 2>/dev/null || true
-rclone sync "`$WS/" b2:FunFun/wotr/saves/ 2>/dev/null || true
+mkdir -p "$WS" "$WP" "$LOG"
+rclone copy b2:FunFun/wotr/saves/ "$WS/" --update 2>/dev/null || true
+rclone copy b2:FunFun/wotr/saves/ "$WP/" --update 2>/dev/null || true
+[ -d /tmp/wis ] && rsync -a --update /tmp/wis/ "$WS/" 2>/dev/null || true
+[ -d /tmp/wis ] && rsync -a --update /tmp/wis/ "$WP/" 2>/dev/null || true
+rclone sync "$WS/" b2:FunFun/wotr/saves/ 2>/dev/null || true
 mkdir -p /root/.config/parsec
-b2 authorize-account '$B2I' '$B2K' 2>/dev/null || true
-b2 download-file-by-name FunFun parsec/config.cfg "`$CFG" 2>/dev/null || true
+rclone copyto b2:FunFun/parsec/config.cfg "$CFG" 2>/dev/null || true
 [ ! -f /usr/bin/parsecd ] && wget -q https://builds.parsec.app/package/parsec-linux.deb -O /tmp/p.deb && (dpkg -i /tmp/p.deb >/dev/null 2>&1 || apt-get install -f -y -qq >/dev/null 2>&1) || true
-if ! grep -q app_session_id "`$CFG" 2>/dev/null; then
-  AUTH=`$(curl -sf -X POST https://kessel-api.parsecgaming.com/v1/auth \
+if ! grep -q app_session_id "$CFG" 2>/dev/null; then
+  AUTH=$(curl -sf -X POST https://kessel-api.parsecgaming.com/v1/auth \
     -H 'Content-Type: application/json' \
-    -d "{\"email\":\"$EMAIL\",\"password\":\"`$PW\",\"tfa\":\"\"}")
-  SID=`$(echo "`$AUTH"|jq -r '.data.id // empty')
-  [ -z "`$SID" ] && echo "AUTH_FAILED: `$AUTH" >&2 && exit 1
-  printf '{"app_host":1,"app_session_id":"%s"}' "`$SID" > "`$CFG"
+    --data-raw "$(jq -n --arg e '__EMAIL__' --arg p "$PW" '{email:$e,password:$p,tfa:""}')")
+  SID=$(echo "$AUTH"|jq -r '.data.id // empty')
+  [ -z "$SID" ] && echo "AUTH_FAILED: $AUTH" >&2 && exit 1
+  printf '{"app_host":1,"app_session_id":"%s"}' "$SID" > "$CFG"
 fi
 pkill Xvfb 2>/dev/null; pkill parsecd 2>/dev/null; sleep 1
 Xvfb :99 -screen 0 1920x1080x24 & sleep 3
 DISPLAY=:99 parsecd app_host=1 & sleep 12
-(while true; do sleep 300; rclone sync "`$WS/" b2:FunFun/wotr/saves/ 2>/dev/null||true; done) &
+(while true; do sleep 300; rclone sync "$WS/" b2:FunFun/wotr/saves/ 2>/dev/null||true; done) &
 disown
-b2 upload-file FunFun "`$CFG" parsec/config.cfg 2>/dev/null || true
+rclone copyto "$CFG" b2:FunFun/parsec/config.cfg 2>/dev/null || true
 echo PARSEC_READY
-"@
+'@
+    $bash = $bash.Replace('__PW64__', $PW64).Replace('__B2I__', $B2I).Replace('__B2K__', $B2K).Replace('__EMAIL__', $EMAIL)
+    # LF only — bash will reject CRLF
+    $bashBytes = [Text.Encoding]::UTF8.GetBytes(($bash -replace "`r`n","`n"))
+
     $tmp="$env:TEMP\ff_$PID.sh"; $out="$env:TEMP\ffout_$PID.txt"; $err="$env:TEMP\fferr_$PID.txt"
-    $bash|Set-Content $tmp -Encoding Ascii
+    [IO.File]::WriteAllBytes($tmp, $bashBytes)
     Start-Process ssh -ArgumentList @("-o","StrictHostKeyChecking=no","-o","UserKnownHostsFile=NUL","-i",$SSHKEY,"-p","$port","root@$ip","bash","-s") `
         -RedirectStandardInput $tmp -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow -Wait | Out-Null
     $res=Get-Content $out -Raw -EA SilentlyContinue
