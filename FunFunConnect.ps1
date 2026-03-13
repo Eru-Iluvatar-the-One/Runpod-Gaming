@@ -264,4 +264,4 @@ disown
 
 Stop-Transcript | Out-Null
 Write-Host "`nLog: $LOG"
-Read-Host "Press Enter to close"
+cmd /c pause
