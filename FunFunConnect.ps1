@@ -2,10 +2,9 @@ param()
 $ErrorActionPreference = "Continue"
 $host.UI.RawUI.WindowTitle = "FunFunPod"
 
-# ── Config ──────────────────────────────────────────────────────────
-$POD_ID  = "lu82dw2kr8nuuj"
-$EMAIL   = "eruilu22@gmail.com"
-$SSHKEY  = "$env:USERPROFILE\.ssh\id_ed25519"
+$POD_ID = "lu82dw2kr8nuuj"
+$EMAIL  = "eruilu22@gmail.com"
+$SSHKEY = "$env:USERPROFILE\.ssh\id_ed25519"
 
 function GetEnv($n) {
     $v = [Environment]::GetEnvironmentVariable($n, "User")
@@ -19,77 +18,61 @@ $PW      = GetEnv "ParsecPW"
 
 function W($m, $c="Cyan") { Write-Host ">> $m" -ForegroundColor $c }
 
-if (-not $API_KEY) { W "ERROR: FunFunPod env var not set." "Red"; Read-Host; exit 1 }
-if (-not $PW)      { W "ERROR: ParsecPW env var not set."  "Red"; Read-Host; exit 1 }
+if (-not $API_KEY) { W "ERROR: FunFunPod env var missing." "Red"; Read-Host; exit 1 }
+if (-not $PW)      { W "ERROR: ParsecPW env var missing."  "Red"; Read-Host; exit 1 }
 
-# ── Start pod ───────────────────────────────────────────────────────
+# ── Resume pod ──────────────────────────────────────────────────────
 W "Starting pod..."
 $startQ = '{"query":"mutation{podResume(input:{podId:\"' + $POD_ID + '\",gpuCount:1}){id desiredStatus}}"}'
-try {
-    Invoke-RestMethod "https://api.runpod.io/graphql?api_key=$API_KEY" `
-        -Method POST -ContentType "application/json" -Body $startQ | Out-Null
-} catch {}
+try { Invoke-RestMethod "https://api.runpod.io/graphql?api_key=$API_KEY" -Method POST -ContentType "application/json" -Body $startQ | Out-Null } catch {}
 
-# ── Poll for SSH port ────────────────────────────────────────────────
-W "Waiting for pod..."
+# ── Poll GraphQL for SSH port ───────────────────────────────────────
+W "Waiting for pod SSH port..."
 $ip = ""; $port = 0; $tries = 0
 do {
-    Start-Sleep 5
-    $tries++
+    Start-Sleep 5; $tries++
     if ($tries -gt 60) { W "Timed out." "Red"; Read-Host; exit 1 }
     try {
-        $pollQ = '{"query":"{pod(input:{podId:\"' + $POD_ID + '\"}){desiredStatus runtime{ports{ip publicPort privatePort}}}}"}'
-        $resp = Invoke-RestMethod "https://api.runpod.io/graphql?api_key=$API_KEY" `
-            -Method POST -ContentType "application/json" -Body $pollQ
-        $pod = $resp.data.pod
-        if ($pod.desiredStatus -eq "RUNNING" -and $pod.runtime -and $pod.runtime.ports) {
+        $q = '{"query":"{myself{pods{id desiredStatus runtime{ports{ip publicPort privatePort}}}}}"}'
+        $r = Invoke-RestMethod "https://api.runpod.io/graphql?api_key=$API_KEY" -Method POST -ContentType "application/json" -Body $q
+        $pod = $r.data.myself.pods | Where-Object { $_.id -eq $POD_ID } | Select-Object -First 1
+        if ($pod -and $pod.desiredStatus -eq "RUNNING" -and $pod.runtime -and $pod.runtime.ports) {
             $sp = $pod.runtime.ports | Where-Object { $_.privatePort -eq 22 } | Select-Object -First 1
             if ($sp) { $ip = $sp.ip; $port = $sp.publicPort }
         }
     } catch {}
-    W "Still waiting... ($tries)"
+    W "Waiting... ($tries)"
 } while (-not $ip)
 
-W "Pod at ${ip}:${port}"
+W "SSH at ${ip}:${port} — pushing Parsec setup..."
 
-# ── Build bash setup ────────────────────────────────────────────────
+# ── Bash payload ────────────────────────────────────────────────────
 $PW_B64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($PW))
-
-$bashScript = @"
+$bash = @"
 #!/bin/bash
 set -e
-B2_ID='$B2_ID'
-B2_KEY='$B2_KEY'
-EMAIL='$EMAIL'
 PW=`$(printf '%s' '$PW_B64' | base64 -d)
 CFG=/root/.config/parsec/config.cfg
 export DEBIAN_FRONTEND=noninteractive
-
 apt-get update -qq
 apt-get install -y -qq wget xvfb curl jq python3-pip >/dev/null 2>&1
 pip3 install b2 -q >/dev/null 2>&1 || true
 mkdir -p /root/.config/parsec
-
-( b2 authorize-account "`$B2_ID" "`$B2_KEY" 2>/dev/null || true ) && \
-( b2 download-file-by-name FunFun parsec/config.cfg "`$CFG" 2>/dev/null || true )
-
+b2 authorize-account '$B2_ID' '$B2_KEY' 2>/dev/null || true
+b2 download-file-by-name FunFun parsec/config.cfg "`$CFG" 2>/dev/null || true
 if [ ! -f /usr/bin/parsecd ]; then
     wget -q https://builds.parsec.app/package/parsec-linux.deb -O /tmp/p.deb
     dpkg -i /tmp/p.deb >/dev/null 2>&1 || apt-get install -f -y -qq >/dev/null 2>&1
 fi
-
 if ! grep -q app_session_id "`$CFG" 2>/dev/null; then
     AUTH=`$(curl -sf -X POST https://kessel-api.parsecgaming.com/v1/auth \
         -H 'Content-Type: application/json' \
-        -d "{\"email\":\"`$EMAIL\",\"password\":\"`$PW\",\"tfa\":\"\"}")
+        -d "{\"email\":\"$EMAIL\",\"password\":\"`$PW\",\"tfa\":\"\"}")
     SID=`$(echo "`$AUTH" | jq -r '.data.id // empty')
     if [ -z "`$SID" ]; then echo "AUTH_FAILED: `$AUTH" >&2; exit 1; fi
     printf '{"app_host":1,"app_session_id":"%s"}' "`$SID" > "`$CFG"
 fi
-
-pkill Xvfb 2>/dev/null || true
-pkill parsecd 2>/dev/null || true
-sleep 1
+pkill Xvfb 2>/dev/null || true; pkill parsecd 2>/dev/null || true; sleep 1
 Xvfb :99 -screen 0 1920x1080x24 &
 sleep 3
 DISPLAY=:99 parsecd app_host=1 &
@@ -98,32 +81,21 @@ b2 upload-file FunFun "`$CFG" parsec/config.cfg 2>/dev/null || true
 echo PARSEC_READY
 "@
 
-$tmp = "$env:TEMP\ffsetup_$(Get-Random).sh"
-$bashScript | Set-Content $tmp -Encoding Ascii
+$tmp = "$env:TEMP\ff_$(Get-Random).sh"
+$bash | Set-Content $tmp -Encoding Ascii
+$out = "$env:TEMP\ffout.txt"
+$err = "$env:TEMP\fferr.txt"
 
-W "Setting up Parsec on pod..."
-$outFile = "$env:TEMP\ffout.txt"
-$errFile  = "$env:TEMP\fferr.txt"
+Start-Process ssh -ArgumentList @("-o","StrictHostKeyChecking=no","-o","UserKnownHostsFile=NUL","-i",$SSHKEY,"-p","$port","root@$ip","bash","-s") `
+    -RedirectStandardInput $tmp -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow -Wait | Out-Null
 
-Start-Process ssh -ArgumentList @(
-    "-o", "StrictHostKeyChecking=no",
-    "-o", "UserKnownHostsFile=NUL",
-    "-i", $SSHKEY,
-    "-p", "$port",
-    "root@$ip",
-    "bash", "-s"
-) -RedirectStandardInput $tmp -RedirectStandardOutput $outFile -RedirectStandardError $errFile -NoNewWindow -Wait -PassThru | Out-Null
-
-$out = Get-Content $outFile -Raw -ErrorAction SilentlyContinue
+$result = Get-Content $out -Raw -ErrorAction SilentlyContinue
 Remove-Item $tmp -ErrorAction SilentlyContinue
 
-if ($out -match "AUTH_FAILED") {
-    W "Parsec auth failed. Check ParsecPW env var." "Red"
-    Write-Host $out; Read-Host; exit 1
-}
+if ($result -match "AUTH_FAILED") { W "Parsec auth failed — check ParsecPW." "Red"; Write-Host $result; Read-Host; exit 1 }
 
-W "Launching Parsec!" "Green"
+W "Done! Launching Parsec..." "Green"
 Start-Process "C:\Program Files\Parsec\parsecd.exe"
-Start-Sleep 3
-W "Hit Reload in Parsec. Pod appears under My Computers." "Green"
+Start-Sleep 4
+W "Hit Reload in Parsec. Pod shows under My Computers." "Green"
 Start-Sleep 5
