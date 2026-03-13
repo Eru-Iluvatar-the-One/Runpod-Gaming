@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 ###############################################################################
-#  RunPod Gaming Rig v10
+#  RunPod Gaming Rig v11
 #  NVIDIA L4 | Ubuntu 22.04 | Sunshine → Moonlight | 4K@144Hz
 #
-#  v10 fixes over v9:
-#    - Xvfb replaces Xorg/modesetting (no DRI access needed in unprivileged container)
-#    - Broken sunshine dpkg record purged before apt installs (was poisoning all apt)
-#    - libayatana + deps installed cleanly after dpkg repair
-#    - Sunshine binary extracted manually (no dpkg -i, avoids re-poisoning)
+#  v11 fixes over v10:
+#    - Purge ALL stale supervisor conf.d files before writing new ones
+#    - Remove stale X lock files before Xvfb launch
+#    - Fix verify chk() arithmetic bug: ((0)) returns exit 1 in bash
+#    - Kill stale Xorg/X processes from prior runs
 ###############################################################################
 
 mkdir -p /workspace/gaming-logs
@@ -40,10 +40,22 @@ err()  { printf "${R}[EE %s]${N} %s\n" "$(date +%H:%M:%S)" "$*"; }
 hdr()  { printf "\n${B}=== %s ===${N}\n" "$*"; }
 
 ###############################################################################
-hdr "0 — BOOTSTRAP"
+hdr "0 — BOOTSTRAP + CLEANUP"
 ###############################################################################
+# Kill ALL stale processes from prior runs
+pkill -x supervisord 2>/dev/null || true
+pkill -f Xvfb        2>/dev/null || true
+pkill -f Xorg        2>/dev/null || true
+pkill -f sunshine     2>/dev/null || true
+pkill -f openbox      2>/dev/null || true
+sleep 2
+
+# Remove stale X lock files
+rm -f /tmp/.X${DISPLAY_NUM}-lock 2>/dev/null || true
+rm -f /tmp/.X11-unix/X${DISPLAY_NUM} 2>/dev/null || true
+
 apt-get install -y curl wget 2>/dev/null || true
-log "curl/wget present"
+log "bootstrap done"
 
 ###############################################################################
 hdr "1 — SSH"
@@ -64,7 +76,6 @@ log "SSH ready"
 ###############################################################################
 hdr "2 — PURGE BROKEN DPKG STATE"
 ###############################################################################
-# sunshine dpkg -i in prior runs left a half-installed record that blocks ALL apt
 dpkg --remove --force-remove-reinstreq sunshine 2>/dev/null || true
 dpkg --purge  --force-remove-reinstreq sunshine 2>/dev/null || true
 dpkg --configure -a 2>/dev/null || true
@@ -78,7 +89,6 @@ export DEBIAN_FRONTEND=noninteractive
 add-apt-repository -y universe 2>/dev/null || true
 apt-get update -qq 2>/dev/null || warn "apt update failed"
 
-# Core X + tools — use Xvfb (virtual framebuffer, no DRI needed)
 apt-get install -y --no-install-recommends \
     xvfb x11-xserver-utils x11-utils xterm openbox dbus-x11 \
     xdotool xauth xkb-data 2>/dev/null || warn "some X pkgs failed"
@@ -89,7 +99,6 @@ apt-get install -y --no-install-recommends \
 apt-get install -y --no-install-recommends \
     rsync jq mesa-utils 2>/dev/null || warn "util pkgs failed"
 
-# Sunshine runtime deps — install individually so one failure doesn't block rest
 for pkg in \
     libayatana-appindicator3-1 \
     libnotify4 \
@@ -107,7 +116,7 @@ done
 ldconfig 2>/dev/null || true
 log "packages done"
 
-# supervisord via pip (more reliable than apt in this image)
+# supervisord via pip
 pip3 install --quiet supervisor 2>/dev/null || true
 SUPD=$(command -v supervisord 2>/dev/null \
     || find /usr/local/bin /root/.local/bin /usr/bin -name supervisord 2>/dev/null | head -1 || true)
@@ -117,7 +126,6 @@ SUPC=$(command -v supervisorctl 2>/dev/null \
     || find /usr/local/bin /root/.local/bin /usr/bin -name supervisorctl 2>/dev/null | head -1 || true)
 [ -n "$SUPC" ] && ln -sf "$SUPC" /usr/local/bin/supervisorctl 2>/dev/null || true
 log "supervisord: $SUPD"
-mkdir -p /etc/supervisor/conf.d
 
 ###############################################################################
 hdr "4 — GPU / NVENC"
@@ -154,8 +162,6 @@ CUDA_REAL=$(find "$LINK_DIR" /usr/local/nvidia/lib64 /usr/lib64 \
 ###############################################################################
 hdr "5 — SUNSHINE (binary extraction only — no dpkg -i)"
 ###############################################################################
-# Never run dpkg -i sunshine.deb again — it has unresolvable deps (libmfx1/Intel)
-# and will re-poison apt. Extract binary + libs only.
 SUN_BIN=$(command -v sunshine 2>/dev/null \
     || find /usr/bin /usr/local/bin -name sunshine -type f 2>/dev/null | head -1 || true)
 
@@ -182,10 +188,13 @@ SUN_BIN=$(command -v sunshine 2>/dev/null \
 [ -z "$SUN_BIN" ] && { err "sunshine binary not found"; exit 1; }
 chmod +x "$SUN_BIN"
 
-# Verify the libayatana dep is actually satisfied now
-if ! ldd "$SUN_BIN" 2>/dev/null | grep -q "libayatana"; then
-    AYATANA_SO=$(ldconfig -p 2>/dev/null | grep libayatana-appindicator3 | awk '{print $NF}' | head -1 || true)
-    [ -n "$AYATANA_SO" ] && log "libayatana found: $AYATANA_SO" || warn "libayatana NOT in ldconfig — sunshine will crash"
+# Check for missing shared libs
+MISSING_LIBS=$(ldd "$SUN_BIN" 2>/dev/null | grep "not found" || true)
+if [ -n "$MISSING_LIBS" ]; then
+    warn "Sunshine has missing libs:"
+    echo "$MISSING_LIBS" | sed 's/^/  /'
+else
+    log "All sunshine shared libs satisfied"
 fi
 
 mkdir -p /root/.config/sunshine
@@ -218,12 +227,12 @@ SC=0; PC=0
 while IFS= read -r -d '' f; do
     cp "$f" "$FERAL_SAVES/"              2>/dev/null || true
     cp "$f" "${PROTON_BASE}/save_games/" 2>/dev/null || true
-    ((SC++)) || true
+    SC=$((SC+1))
 done < <(find /workspace -maxdepth 4 -name "*.save" -print0 2>/dev/null)
 while IFS= read -r -d '' f; do
     cp "$f" "$FERAL_PACKS/"        2>/dev/null || true
     cp "$f" "${PROTON_BASE}/pack/" 2>/dev/null || true
-    ((PC++)) || true
+    PC=$((PC+1))
 done < <(find /workspace -maxdepth 4 -name "*.pack" -print0 2>/dev/null)
 log "Assets: $SC .save  $PC .pack"
 
@@ -260,6 +269,8 @@ fi
 ###############################################################################
 hdr "8 — PULSEAUDIO"
 ###############################################################################
+pulseaudio --kill 2>/dev/null || true
+sleep 1
 pulseaudio --daemonize --exit-idle-time=-1 2>/dev/null || true
 sleep 1
 pactl load-module module-null-sink sink_name=virtual_out 2>/dev/null || true
@@ -269,15 +280,15 @@ log "PulseAudio virtual sink ready"
 ###############################################################################
 hdr "9 — SUPERVISOR"
 ###############################################################################
-pkill -x supervisord 2>/dev/null || true; sleep 1
-pkill -f Xvfb        2>/dev/null || true
-pkill -f sunshine    2>/dev/null || true
-
 mkdir -p /run/user/0; chmod 700 /run/user/0
 
 XVFB_BIN=$(command -v Xvfb 2>/dev/null || find /usr/bin -name Xvfb 2>/dev/null | head -1 || true)
-[ -z "$XVFB_BIN" ] && { err "Xvfb not found"; exit 1; }
+[ -z "$XVFB_BIN" ] && { err "Xvfb not found — apt install xvfb likely failed"; exit 1; }
 log "Xvfb: $XVFB_BIN"
+
+# *** CRITICAL: purge ALL old supervisor configs before writing new ones ***
+rm -f /etc/supervisor/conf.d/*.conf 2>/dev/null || true
+mkdir -p /etc/supervisor/conf.d
 
 cat > /etc/supervisor/supervisord.conf << SUPCONF
 [supervisord]
@@ -313,7 +324,6 @@ stderr_logfile=/workspace/gaming-logs/pulse.log
 environment=HOME="/root"
 EOF
 
-# Xvfb: virtual framebuffer — no DRI, no KMS, no permission issues
 cat > /etc/supervisor/conf.d/xvfb.conf << XVEOF
 [program:xvfb]
 command=${XVFB_BIN} :${DISPLAY_NUM} -screen 0 ${RES_W}x${RES_H}x24 -ac +extension GLX +extension RANDR -noreset
@@ -364,13 +374,21 @@ supervisorctl -c /etc/supervisor/supervisord.conf status 2>/dev/null | sed 's/^/
 hdr "11 — VERIFY"
 ###############################################################################
 PASS=0; FAIL=0
-chk() { [ "$1" = ok ] && { printf "  [OK] %s\n" "$2"; ((PASS++)); } || { printf "  [!!] %s\n" "$2"; ((FAIL++)); }; }
+chk() {
+    if [ "$1" = ok ]; then
+        printf "  [OK] %s\n" "$2"
+        PASS=$((PASS+1))
+    else
+        printf "  [!!] %s\n" "$2"
+        FAIL=$((FAIL+1))
+    fi
+}
 
-pgrep -x sshd    &>/dev/null && chk ok "SSHD"        || chk fail "SSHD"
-xdpyinfo -display ":${DISPLAY_NUM}" &>/dev/null      && chk ok  "Xvfb :${DISPLAY_NUM}"  || chk fail "Xvfb :${DISPLAY_NUM} — check ${LOG_DIR}/xvfb.log"
-ldconfig -p 2>/dev/null | grep -q libnvidia-encode   && chk ok  "NVENC in ldconfig"     || chk fail "NVENC not in ldconfig"
-ldconfig -p 2>/dev/null | grep -q libayatana          && chk ok  "libayatana present"    || chk fail "libayatana MISSING — sunshine will crash"
-pgrep -f sunshine &>/dev/null                        && chk ok  "Sunshine running"      || chk fail "Sunshine — check ${LOG_DIR}/sunshine.log"
+pgrep -x sshd &>/dev/null                           && chk ok "SSHD"                                    || chk fail "SSHD"
+xdpyinfo -display ":${DISPLAY_NUM}" &>/dev/null     && chk ok "Xvfb :${DISPLAY_NUM}"                    || chk fail "Xvfb :${DISPLAY_NUM} — check ${LOG_DIR}/xvfb.log"
+ldconfig -p 2>/dev/null | grep -q libnvidia-encode   && chk ok "NVENC in ldconfig"                       || chk fail "NVENC not in ldconfig"
+ldconfig -p 2>/dev/null | grep -q libayatana          && chk ok "libayatana present"                      || chk fail "libayatana MISSING — sunshine will crash"
+pgrep -f sunshine &>/dev/null                        && chk ok "Sunshine running"                        || chk fail "Sunshine — check ${LOG_DIR}/sunshine.log"
 echo "  GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | head -1)"
 echo ""
 echo "  Result: ${PASS} passed / ${FAIL} failed"
@@ -378,7 +396,7 @@ echo "  Result: ${PASS} passed / ${FAIL} failed"
 ###############################################################################
 echo ""
 echo "==========================================="
-echo " RunPod Gaming Rig v10 — ${SECONDS}s"
+echo " RunPod Gaming Rig v11 — ${SECONDS}s"
 echo "==========================================="
 echo " SSH:  ssh root@${RUNPOD_HOST} -p ${RUNPOD_SSH_PORT}"
 echo " Pass: ${ROOT_PASS}"
