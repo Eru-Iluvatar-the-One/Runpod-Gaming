@@ -248,7 +248,7 @@ RCONF
     cat > /usr/local/bin/b2-sync.sh << SYNCEOF
 #!/usr/bin/env bash
 rclone sync "${FERAL_SAVES}/" "b2funfun:${B2_BUCKET}/saves/" --log-file="${LOG_DIR}/b2.log"
-rclone sync "${FERAL_PACKS}/" "b2funfun:${B2_BUCKET}/packs/'" --log-file="${LOG_DIR}/b2.log"
+rclone sync "${FERAL_PACKS}/" "b2funfun:${B2_BUCKET}/packs/" --log-file="${LOG_DIR}/b2.log"
 SYNCEOF
     chmod +x /usr/local/bin/b2-sync.sh
     (crontab -l 2>/dev/null; echo "*/15 * * * * /usr/local/bin/b2-sync.sh") | sort -u | crontab - 2>/dev/null || true
