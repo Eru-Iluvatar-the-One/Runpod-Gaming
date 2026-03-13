@@ -43,8 +43,7 @@ try {
     }
     function WC($i,$p){ @{podId=$POD_ID;ip=$i;port=$p}|ConvertTo-Json|Set-Content $CACHE -Force }
     function SSH-Run($cmd) {
-        $p = Start-Process ssh -ArgumentList ($SSH + $cmd) -NoNewWindow -Wait -PassThru
-        return $p.ExitCode
+        Start-Process ssh -ArgumentList ($SSH + $cmd) -NoNewWindow -Wait -PassThru | Out-Null
     }
     function SSH-Out($cmd) {
         $out = "$env:TEMP\sshout_$PID.txt"
@@ -72,7 +71,7 @@ try {
     if(Test-Path $WOTR){
         Write-Host ">> Uploading saves..."
         $ErrorActionPreference="Continue"
-        SSH-Run "mkdir -p /tmp/wis" | Out-Null
+        SSH-Run "mkdir -p /tmp/wis"
         Start-Process scp -ArgumentList @("-r","-P","$KNOWN_PORT","-i",$SSHKEY,"-o","StrictHostKeyChecking=no","-o","UserKnownHostsFile=NUL","`"$WOTR`"","root@${KNOWN_IP}:/tmp/wis/") -NoNewWindow -Wait | Out-Null
         $ErrorActionPreference="Stop"
     }
@@ -86,7 +85,7 @@ set -euo pipefail
 exec > /workspace/ff_setup.log 2>&1
 echo "=== SETUP START ==="
 PW=$(printf '%s' '__PW64__' | base64 -d)
-CFG=/root/.config/parsec/config.cfg
+CFG=/root/.parsec/config.txt
 WS="/root/.local/share/unity3d/Owlcat Games/Pathfinder Wrath Of The Righteous/Saved Games"
 WP="/root/.steam/steam/steamapps/compatdata/1184370/pfx/drive_c/users/steamuser/AppData/LocalLow/Owlcat Games/Pathfinder Wrath Of The Righteous/Saved Games"
 export DEBIAN_FRONTEND=noninteractive
@@ -112,40 +111,31 @@ rclone copy b2:FunFun/wotr/saves/ "$WP/" --update 2>/dev/null || true
 [ -d /tmp/wis ] && rsync -a --update /tmp/wis/ "$WS/" 2>/dev/null || true
 [ -d /tmp/wis ] && rsync -a --update /tmp/wis/ "$WP/" 2>/dev/null || true
 rclone sync "$WS/" b2:FunFun/wotr/saves/ 2>/dev/null || true
-echo "Parsec config..."
-mkdir -p /root/.config/parsec
-rclone copyto b2:FunFun/parsec/config.cfg "$CFG" 2>/dev/null || true
+echo "Installing Parsec..."
 [ ! -f /usr/bin/parsecd ] && wget -q https://builds.parsec.app/package/parsec-linux.deb -O /tmp/p.deb \
   && (dpkg -i /tmp/p.deb >/dev/null 2>&1 || apt-get install -f -y -qq >/dev/null 2>&1) || true
-if ! grep -q app_session_id "$CFG" 2>/dev/null; then
+mkdir -p /root/.parsec
+if ! grep -q session_id "$CFG" 2>/dev/null; then
   echo "Authenticating Parsec..."
   JSON=$(jq -n --arg e '__EMAIL__' --arg p "$PW" '{"email":$e,"password":$p,"tfa":""}')
-  echo "Sending auth request..."
   AUTH=$(curl -s -X POST https://kessel-api.parsec.app/v1/auth \
-    -H 'Content-Type: application/json' -d "$JSON") || AUTH=""
+    -H 'Content-Type: application/json' -d "$JSON")
   [ -z "$AUTH" ] && AUTH=$(curl -s -X POST https://kessel-api.parsecgaming.com/v1/auth \
     -H 'Content-Type: application/json' -d "$JSON") || true
   echo "Auth response: $AUTH"
   TFA=$(echo "$AUTH" | jq -r '.data.tfa_required // false' 2>/dev/null || echo false)
   [ "$TFA" = "true" ] && echo "AUTH_FAILED: 2FA enabled" && exit 1
-  SID=$(echo "$AUTH" | jq -r '.data.id // empty' 2>/dev/null || true)
-  [ -z "$SID" ] && echo "AUTH_FAILED: no session id — $AUTH" && exit 1
-  cat > "$CFG" << PCFG
-app_host = 1
-app_session_id = ${SID}
-server_resolution_x = 1920
-server_resolution_y = 1080
-encoder_bitrate = 50
-encoder_fps = 60
-PCFG
-  echo "Config written."
-  rclone copyto "$CFG" b2:FunFun/parsec/config.cfg 2>/dev/null || true
+  SID=$(echo "$AUTH" | jq -r '.session_id // .data.session_id // .data.id // empty' 2>/dev/null || true)
+  [ -z "$SID" ] && echo "AUTH_FAILED: no session_id — $AUTH" && exit 1
+  printf 'session_id = %s\napp_host = 1\n' "$SID" > "$CFG"
+  echo "Config written: $CFG"
+  rclone copyto "$CFG" b2:FunFun/parsec/config.txt 2>/dev/null || true
 fi
 echo "Launching Parsec..."
 pkill Xvfb 2>/dev/null || true; pkill parsecd 2>/dev/null || true; sleep 1
 Xvfb :99 -screen 0 1920x1080x24 &
 sleep 3
-DISPLAY=:99 parsecd app_host=1 &
+DISPLAY=:99 parsecd &
 sleep 15
 ps aux | grep -E 'parsecd|Xvfb' | grep -v grep
 (while true; do sleep 300; rclone sync "$WS/" b2:FunFun/wotr/saves/ 2>/dev/null||true; done) &
@@ -162,14 +152,14 @@ echo "=== PARSEC_READY ==="
     Remove-Item $tmp -EA SilentlyContinue
 
     Write-Host ">> Executing script (takes ~2 min)..."
-    SSH-Run "bash /tmp/ff_setup.sh" | Out-Null
+    SSH-Run "bash /tmp/ff_setup.sh"
 
     Write-Host ">> Fetching log..."
     $res = SSH-Out "cat /workspace/ff_setup.log"
     Write-Host "=== POD LOG ===`n$res"
 
-    if($res -match "AUTH_FAILED"){throw "Parsec auth failed — check ParsecPW env var"}
-    if($res -notmatch "PARSEC_READY"){Write-Host "!! PARSEC_READY not seen — check log above" -ForegroundColor Yellow}
+    if($res -match "AUTH_FAILED"){throw "Parsec auth failed: $res"}
+    if($res -notmatch "PARSEC_READY"){Write-Host "!! PARSEC_READY not seen" -ForegroundColor Yellow}
 
     Write-Host ">> Launching Parsec..." -ForegroundColor Green
     Start-Process "C:\Program Files\Parsec\parsecd.exe"
@@ -177,7 +167,7 @@ echo "=== PARSEC_READY ==="
     Write-Host ">> Done. Click FunFunPod in My Computers." -ForegroundColor Green
 } catch {
     Write-Host ("`n!! ERROR: " + $_) -ForegroundColor Red
-    Write-Host "Check pod log: ssh -p $KNOWN_PORT -i $SSHKEY root@$KNOWN_IP cat /workspace/ff_setup.log" -ForegroundColor Yellow
+    Write-Host "Pod log: ssh -p $KNOWN_PORT -i $SSHKEY root@$KNOWN_IP cat /workspace/ff_setup.log" -ForegroundColor Yellow
 }
 
 Stop-Transcript | Out-Null
