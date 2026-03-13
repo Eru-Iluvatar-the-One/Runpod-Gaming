@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 ###############################################################################
-#  RunPod Gaming Rig v8
+#  RunPod Gaming Rig v9
 #  NVIDIA L4 | Ubuntu 22.04 | Sunshine → Moonlight | 4K@144Hz
 #
-#  v8 fixes:
-#    - Sunshine deb extracted to STAGING DIR, not / (was clobbering /bin/sh)
-#    - nvidia_drv.so extracted to staging, copied selectively (EXDEV fix)
-#    - /dev/dri: mknod failure tolerated; warns if nodes still missing
-#    - SSH restart hardened
+#  v9 fixes over v8:
+#    - libayatana-appindicator3-1 installed in packages phase (Sunshine dep)
+#    - DRI nodes auto-detected at runtime (card4/renderD131, not card0/renderD128)
+#    - xorg.conf uses modesetting driver (bypasses NVIDIA DDX kernel module fail)
 ###############################################################################
 
 mkdir -p /workspace/gaming-logs
@@ -40,8 +39,6 @@ err()  { printf "${R}[EE %s]${N} %s\n" "$(date +%H:%M:%S)" "$*"; }
 hdr()  { printf "\n${B}=== %s ===${N}\n" "$*"; }
 
 # ── EXDEV-safe apt install ─────────────────────────────────────
-# Extracts all debs to / via dpkg-deb -x (tar, no rename()).
-# SAFE for system packages — do NOT use for bundled-binary debs like Sunshine.
 safe_install() {
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@" 2>/dev/null && return 0
     warn "EXDEV fallback: $*"
@@ -56,11 +53,9 @@ safe_install() {
 }
 
 # ── Staged deb install ─────────────────────────────────────────
-# For debs that bundle non-standard files (Sunshine, nvidia DDX):
-# extract to a temp dir, then selectively copy only known safe paths.
 staged_deb_install() {
-    local deb="$1"; shift          # deb file
-    local paths=("$@")             # list of paths to copy from stage to /
+    local deb="$1"; shift
+    local paths=("$@")
     local stage
     stage=$(mktemp -d /tmp/deb-stage-XXXXXX)
     dpkg-deb -x "$deb" "$stage" 2>/dev/null || { rm -rf "$stage"; return 1; }
@@ -108,6 +103,8 @@ apt-get update -qq 2>/dev/null || warn "apt update failed"
 safe_install xserver-xorg-core x11-xserver-utils x11-utils xinit xterm openbox dbus-x11 xdotool xauth xkb-data
 safe_install pulseaudio pulseaudio-utils alsa-utils
 safe_install rsync jq mesa-utils
+# v9: Sunshine runtime dep — was missing in v8
+safe_install libayatana-appindicator3-1
 
 # supervisord
 pip3 install --quiet supervisor 2>/dev/null || true
@@ -124,11 +121,17 @@ mkdir -p /etc/supervisor/conf.d
 ###############################################################################
 hdr "3 — GPU"
 ###############################################################################
-# mknod requires --privileged; RunPod L4 may deny it. Tolerate the failure.
+# v9: auto-detect real DRI nodes — mknod is denied in non-privileged containers
+# and hardcoded card0/renderD128 don't exist on this pod (actual: card4/renderD131)
 mkdir -p /dev/dri
-mknod -m 666 /dev/dri/card0      c 226 0   2>/dev/null || true
-mknod -m 666 /dev/dri/renderD128 c 226 128 2>/dev/null || true
 ls -la /dev/dri/ 2>/dev/null || true
+
+DRI_CARD=$(ls /dev/dri/card* 2>/dev/null | sort -V | tail -1 || true)
+DRI_RENDER=$(ls /dev/dri/renderD* 2>/dev/null | sort -V | tail -1 || true)
+[ -z "$DRI_CARD" ]   && { warn "No /dev/dri/card* found — xorg will likely fail"; DRI_CARD="/dev/dri/card0"; } \
+                     || log "DRI card:   $DRI_CARD"
+[ -z "$DRI_RENDER" ] && { warn "No /dev/dri/renderD* found";                     DRI_RENDER="/dev/dri/renderD128"; } \
+                     || log "DRI render: $DRI_RENDER"
 
 GPU_NAME=$(nvidia-smi --query-gpu=name           --format=csv,noheader 2>/dev/null | head -1 || echo "UNKNOWN")
 DRV_FULL=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 || echo "570.0")
@@ -141,7 +144,7 @@ F_DEC=$(echo "$BUS_BDF" | cut -d. -f2)
 GPU_BUSID="PCI:$((16#${B_HEX})):$((16#${D_HEX})):${F_DEC}"
 log "GPU=$GPU_NAME drv=$DRV_MAJ BusID=$GPU_BUSID"
 
-# nvidia DDX — STAGED extraction to avoid EXDEV clobbering system paths
+# nvidia DDX staged extraction (kept for reference; not used by modesetting xorg.conf)
 NV_DDX_STAGE=$(mktemp -d /tmp/nv-ddx-XXXXXX)
 ( cd "$NV_DDX_STAGE" && apt-get download "xserver-xorg-video-nvidia-${DRV_MAJ}" 2>/dev/null ) || true
 NV_DEB=$(ls "$NV_DDX_STAGE"/*.deb 2>/dev/null | head -1 || true)
@@ -152,7 +155,7 @@ if [ -n "$NV_DEB" ]; then
     if [ -n "$NVDRV_SO" ]; then
         mkdir -p /usr/lib/xorg/modules/drivers
         cp -f "$NVDRV_SO" /usr/lib/xorg/modules/drivers/nvidia_drv.so
-        log "nvidia_drv.so installed via staged extraction"
+        log "nvidia_drv.so installed (not used by modesetting but available)"
     fi
     rm -rf "$NV_EXTRACT"
 fi
@@ -189,6 +192,8 @@ XORG_BIN=$(command -v Xorg 2>/dev/null || find /usr/lib/xorg /usr/bin -name Xorg
 [ -z "$XORG_BIN" ] && { err "Xorg binary not found"; exit 1; }
 log "Xorg: $XORG_BIN"
 
+# v9: modesetting driver — bypasses NVIDIA DDX kernel module init failure entirely.
+# Sunshine x11 capture works fine with modesetting. adapter_name uses detected render node.
 mkdir -p /etc/X11
 cat > /etc/X11/xorg.conf << XORGEOF
 Section "ServerLayout"
@@ -210,14 +215,10 @@ EndSection
 
 Section "Device"
     Identifier     "Device0"
-    Driver         "nvidia"
+    Driver         "modesetting"
+    Option         "kmsdev"   "${DRI_CARD}"
     BusID          "${GPU_BUSID}"
-    Option         "AllowEmptyInitialConfiguration" "True"
-    Option         "ConnectedMonitor"  "DP-0"
-    Option         "UseDisplayDevice"  "DP-0"
-    Option         "UseEDID"           "False"
-    Option         "HardDPMS"          "False"
-    Option         "ModeValidation"    "NoMaxPClkCheck,NoEdidMaxPClkCheck,NoMaxSizeCheck,NoHorizSyncCheck,NoVertRefreshCheck,NoVirtualSizeCheck,NoExtendedGpuCapabilitiesCheck,NoTotalSizeCheck,NoDualLinkDVICheck,NoDisplayPortBandwidthCheck,AllowNon3DVisionModes"
+    Option         "AccelMethod" "none"
 EndSection
 
 Section "Screen"
@@ -225,36 +226,29 @@ Section "Screen"
     Device         "Device0"
     Monitor        "Monitor0"
     DefaultDepth    24
-    Option         "MetaModes"    "DP-0: ${RES_W}x${RES_H}_${RES_HZ} +0+0"
-    Option         "TripleBuffer" "on"
     SubSection     "Display"
         Depth       24
         Modes      "${RES_W}x${RES_H}_${RES_HZ}" "${RES_W}x${RES_H}" "2560x1440" "1920x1080"
     EndSubSection
 EndSection
 XORGEOF
-log "xorg.conf written ($GPU_BUSID)"
+log "xorg.conf written (modesetting, kmsdev=${DRI_CARD}, BusID=${GPU_BUSID})"
 
 ###############################################################################
 hdr "6 — SUNSHINE (staged extraction — does NOT touch /bin or /usr/bin)"
 ###############################################################################
 if ! command -v sunshine &>/dev/null; then
     log "Downloading Sunshine..."
-    # Pin to v0.23.1 — newer releases bundle system binaries that clobber /bin/sh
     SUN_URL="https://github.com/LizardByte/Sunshine/releases/download/v0.23.1/sunshine-ubuntu-22.04-amd64.deb"
     curl -fsSL "$SUN_URL" -o /tmp/sunshine.deb || { err "Sunshine download failed"; exit 1; }
 
-    # Try normal dpkg first (works if dpkg temp and /usr/bin are on same fs)
     if dpkg -i /tmp/sunshine.deb 2>/dev/null; then
         log "Sunshine installed via dpkg"
     else
         warn "dpkg EXDEV — using staged extraction"
-        # Extract to staging dir, then copy ONLY sunshine-specific paths
         SUN_STAGE=$(mktemp -d /tmp/sun-stage-XXXXXX)
         dpkg-deb -x /tmp/sunshine.deb "$SUN_STAGE"
-        # Copy binary
         [ -f "${SUN_STAGE}/usr/bin/sunshine" ]    && cp -f "${SUN_STAGE}/usr/bin/sunshine"    /usr/bin/sunshine
-        # Copy libs if present
         [ -d "${SUN_STAGE}/usr/lib/sunshine" ]    && { mkdir -p /usr/lib/sunshine; cp -a "${SUN_STAGE}/usr/lib/sunshine/." /usr/lib/sunshine/; }
         [ -d "${SUN_STAGE}/usr/share/sunshine" ]  && { mkdir -p /usr/share/sunshine; cp -a "${SUN_STAGE}/usr/share/sunshine/." /usr/share/sunshine/; }
         [ -d "${SUN_STAGE}/etc/sunshine" ]        && { mkdir -p /etc/sunshine; cp -a "${SUN_STAGE}/etc/sunshine/." /etc/sunshine/; }
@@ -272,7 +266,7 @@ chmod +x "$SUN_BIN" 2>/dev/null || true
 log "Sunshine: $SUN_BIN"
 
 mkdir -p /root/.config/sunshine
-cat > /root/.config/sunshine/sunshine.conf << 'SUNEOF'
+cat > /root/.config/sunshine/sunshine.conf << SUNEOF
 bind_address          = 127.0.0.1
 port                  = 47989
 upnp                  = off
@@ -280,7 +274,7 @@ origin_web_ui_allowed = pc
 address_family        = ipv4
 capture               = x11
 encoder               = nvenc
-adapter_name          = /dev/dri/renderD128
+adapter_name          = ${DRI_RENDER}
 output_name           = 0
 resolutions           = [3840x2160, 2560x1440, 1920x1080]
 fps                   = [144, 60, 30]
@@ -291,7 +285,7 @@ min_log_level         = info
 SUNEOF
 
 "$SUN_BIN" --creds admin gondolin123 2>/dev/null || warn "sunshine --creds failed — set via web UI"
-log "Sunshine configured"
+log "Sunshine configured (adapter_name=${DRI_RENDER})"
 
 ###############################################################################
 hdr "7 — GAME ASSETS"
@@ -447,7 +441,7 @@ chk() { [ "$1" = ok ] && { printf "  [OK] %s\n" "$2"; ((PASS++)); } || { printf 
 pgrep -x sshd    &>/dev/null && chk ok "SSHD"        || chk fail "SSHD"
 xdpyinfo -display ":${DISPLAY_NUM}" &>/dev/null      && chk ok  "Xorg :${DISPLAY_NUM}" || chk fail "Xorg :${DISPLAY_NUM} — check ${LOG_DIR}/Xorg.${DISPLAY_NUM}.log"
 ldconfig -p 2>/dev/null | grep -q libnvidia-encode   && chk ok  "NVENC in ldconfig"    || chk fail "NVENC not in ldconfig"
-[ -c /dev/dri/renderD128 ]                           && chk ok  "/dev/dri/renderD128"  || chk fail "/dev/dri/renderD128 missing (mknod denied — check RunPod container perms)"
+[ -c "${DRI_RENDER}" ]                               && chk ok  "${DRI_RENDER}"        || chk fail "${DRI_RENDER} missing"
 pgrep -f sunshine &>/dev/null                        && chk ok  "Sunshine"             || chk fail "Sunshine — check ${LOG_DIR}/sunshine.log"
 echo "  GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | head -1)"
 echo ""
@@ -456,7 +450,7 @@ echo "  Result: ${PASS} passed / ${FAIL} failed"
 ###############################################################################
 echo ""
 echo "==========================================="
-echo " RunPod Gaming Rig v8 — ${SECONDS}s"
+echo " RunPod Gaming Rig v9 — ${SECONDS}s"
 echo "==========================================="
 echo " SSH:  ssh root@${RUNPOD_HOST} -p ${RUNPOD_SSH_PORT}"
 echo " Pass: ${ROOT_PASS}"
