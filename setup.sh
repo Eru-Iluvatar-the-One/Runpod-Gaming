@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 ###############################################################################
-#  RunPod Gaming Rig v9
+#  RunPod Gaming Rig v10
 #  NVIDIA L4 | Ubuntu 22.04 | Sunshine → Moonlight | 4K@144Hz
 #
-#  v9 fixes over v8:
-#    - libayatana-appindicator3-1 installed in packages phase (Sunshine dep)
-#    - DRI nodes auto-detected at runtime (card4/renderD131, not card0/renderD128)
-#    - xorg.conf uses modesetting driver (bypasses NVIDIA DDX kernel module fail)
+#  v10 fixes over v9:
+#    - Xvfb replaces Xorg/modesetting (no DRI access needed in unprivileged container)
+#    - Broken sunshine dpkg record purged before apt installs (was poisoning all apt)
+#    - libayatana + deps installed cleanly after dpkg repair
+#    - Sunshine binary extracted manually (no dpkg -i, avoids re-poisoning)
 ###############################################################################
 
 mkdir -p /workspace/gaming-logs
@@ -38,39 +39,6 @@ warn() { printf "${Y}[WW %s]${N} %s\n" "$(date +%H:%M:%S)" "$*"; }
 err()  { printf "${R}[EE %s]${N} %s\n" "$(date +%H:%M:%S)" "$*"; }
 hdr()  { printf "\n${B}=== %s ===${N}\n" "$*"; }
 
-# ── EXDEV-safe apt install ─────────────────────────────────────
-safe_install() {
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@" 2>/dev/null && return 0
-    warn "EXDEV fallback: $*"
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -d --no-install-recommends "$@" 2>/dev/null || true
-    local n=0
-    for deb in /var/cache/apt/archives/*.deb; do
-        [ -f "$deb" ] || continue
-        dpkg-deb -x "$deb" / 2>/dev/null && ((n++)) || true
-    done
-    ldconfig 2>/dev/null || true
-    log "Extracted ${n} system debs"
-}
-
-# ── Staged deb install ─────────────────────────────────────────
-staged_deb_install() {
-    local deb="$1"; shift
-    local paths=("$@")
-    local stage
-    stage=$(mktemp -d /tmp/deb-stage-XXXXXX)
-    dpkg-deb -x "$deb" "$stage" 2>/dev/null || { rm -rf "$stage"; return 1; }
-    for p in "${paths[@]}"; do
-        local src="${stage}${p}"
-        local dst_dir
-        dst_dir=$(dirname "$p")
-        [ -e "$src" ] || continue
-        mkdir -p "$dst_dir"
-        cp -a "$src" "$p" 2>/dev/null || true
-    done
-    rm -rf "$stage"
-    ldconfig 2>/dev/null || true
-}
-
 ###############################################################################
 hdr "0 — BOOTSTRAP"
 ###############################################################################
@@ -91,26 +59,59 @@ grep -q '^PermitRootLogin' "$CFG" \
 grep -q '^#PasswordAuthentication' "$CFG" && sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' "$CFG" || true
 grep -q '^#PermitRootLogin' "$CFG"        && sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' "$CFG"              || true
 service ssh restart 2>/dev/null || systemctl restart ssh 2>/dev/null || /usr/sbin/sshd 2>/dev/null || true
-log "SSH: PasswordAuthentication yes, PermitRootLogin yes"
+log "SSH ready"
 
 ###############################################################################
-hdr "2 — PACKAGES"
+hdr "2 — PURGE BROKEN DPKG STATE"
+###############################################################################
+# sunshine dpkg -i in prior runs left a half-installed record that blocks ALL apt
+dpkg --remove --force-remove-reinstreq sunshine 2>/dev/null || true
+dpkg --purge  --force-remove-reinstreq sunshine 2>/dev/null || true
+dpkg --configure -a 2>/dev/null || true
+apt-get -f install -y 2>/dev/null || true
+log "dpkg state clean"
+
+###############################################################################
+hdr "3 — PACKAGES"
 ###############################################################################
 export DEBIAN_FRONTEND=noninteractive
 add-apt-repository -y universe 2>/dev/null || true
 apt-get update -qq 2>/dev/null || warn "apt update failed"
 
-safe_install xserver-xorg-core x11-xserver-utils x11-utils xinit xterm openbox dbus-x11 xdotool xauth xkb-data
-safe_install pulseaudio pulseaudio-utils alsa-utils
-safe_install rsync jq mesa-utils
-# v9: Sunshine runtime dep — was missing in v8
-safe_install libayatana-appindicator3-1
+# Core X + tools — use Xvfb (virtual framebuffer, no DRI needed)
+apt-get install -y --no-install-recommends \
+    xvfb x11-xserver-utils x11-utils xterm openbox dbus-x11 \
+    xdotool xauth xkb-data 2>/dev/null || warn "some X pkgs failed"
 
-# supervisord
+apt-get install -y --no-install-recommends \
+    pulseaudio pulseaudio-utils alsa-utils 2>/dev/null || warn "pulse pkgs failed"
+
+apt-get install -y --no-install-recommends \
+    rsync jq mesa-utils 2>/dev/null || warn "util pkgs failed"
+
+# Sunshine runtime deps — install individually so one failure doesn't block rest
+for pkg in \
+    libayatana-appindicator3-1 \
+    libnotify4 \
+    libminiupnpc17 \
+    libevdev2 \
+    libnuma1 \
+    libboost-locale1.74.0 \
+    libboost-thread1.74.0 \
+    libboost-filesystem1.74.0 \
+    libboost-log1.74.0 \
+    libboost-program-options1.74.0; do
+    apt-get install -y --no-install-recommends "$pkg" 2>/dev/null \
+        || warn "optional dep $pkg not available — skipping"
+done
+ldconfig 2>/dev/null || true
+log "packages done"
+
+# supervisord via pip (more reliable than apt in this image)
 pip3 install --quiet supervisor 2>/dev/null || true
 SUPD=$(command -v supervisord 2>/dev/null \
     || find /usr/local/bin /root/.local/bin /usr/bin -name supervisord 2>/dev/null | head -1 || true)
-[ -z "$SUPD" ] && { safe_install supervisor; SUPD=$(command -v supervisord 2>/dev/null || true); }
+[ -z "$SUPD" ] && { apt-get install -y supervisor 2>/dev/null || true; SUPD=$(command -v supervisord 2>/dev/null || true); }
 [ -z "$SUPD" ] && { err "supervisord not found"; exit 1; }
 SUPC=$(command -v supervisorctl 2>/dev/null \
     || find /usr/local/bin /root/.local/bin /usr/bin -name supervisorctl 2>/dev/null | head -1 || true)
@@ -119,51 +120,16 @@ log "supervisord: $SUPD"
 mkdir -p /etc/supervisor/conf.d
 
 ###############################################################################
-hdr "3 — GPU"
+hdr "4 — GPU / NVENC"
 ###############################################################################
-# v9: auto-detect real DRI nodes — mknod is denied in non-privileged containers
-# and hardcoded card0/renderD128 don't exist on this pod (actual: card4/renderD131)
-mkdir -p /dev/dri
-ls -la /dev/dri/ 2>/dev/null || true
-
-DRI_CARD=$(ls /dev/dri/card* 2>/dev/null | sort -V | tail -1 || true)
 DRI_RENDER=$(ls /dev/dri/renderD* 2>/dev/null | sort -V | tail -1 || true)
-[ -z "$DRI_CARD" ]   && { warn "No /dev/dri/card* found — xorg will likely fail"; DRI_CARD="/dev/dri/card0"; } \
-                     || log "DRI card:   $DRI_CARD"
-[ -z "$DRI_RENDER" ] && { warn "No /dev/dri/renderD* found";                     DRI_RENDER="/dev/dri/renderD128"; } \
+[ -z "$DRI_RENDER" ] && { warn "No renderD* found"; DRI_RENDER="/dev/dri/renderD128"; } \
                      || log "DRI render: $DRI_RENDER"
 
 GPU_NAME=$(nvidia-smi --query-gpu=name           --format=csv,noheader 2>/dev/null | head -1 || echo "UNKNOWN")
 DRV_FULL=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 || echo "570.0")
-DRV_MAJ=$(echo "$DRV_FULL" | cut -d. -f1)
-BUS_RAW=$(nvidia-smi --query-gpu=pci.bus_id      --format=csv,noheader 2>/dev/null | head -1 || echo "0000:00:24.0")
-BUS_BDF=$(echo "$BUS_RAW" | sed 's/^[0-9A-Fa-f]*://')
-B_HEX=$(echo "$BUS_BDF" | cut -d: -f1)
-D_HEX=$(echo "$BUS_BDF" | cut -d: -f2 | cut -d. -f1)
-F_DEC=$(echo "$BUS_BDF" | cut -d. -f2)
-GPU_BUSID="PCI:$((16#${B_HEX})):$((16#${D_HEX})):${F_DEC}"
-log "GPU=$GPU_NAME drv=$DRV_MAJ BusID=$GPU_BUSID"
+log "GPU=$GPU_NAME drv=$DRV_FULL"
 
-# nvidia DDX staged extraction (kept for reference; not used by modesetting xorg.conf)
-NV_DDX_STAGE=$(mktemp -d /tmp/nv-ddx-XXXXXX)
-( cd "$NV_DDX_STAGE" && apt-get download "xserver-xorg-video-nvidia-${DRV_MAJ}" 2>/dev/null ) || true
-NV_DEB=$(ls "$NV_DDX_STAGE"/*.deb 2>/dev/null | head -1 || true)
-if [ -n "$NV_DEB" ]; then
-    NV_EXTRACT=$(mktemp -d /tmp/nv-extract-XXXXXX)
-    dpkg-deb -x "$NV_DEB" "$NV_EXTRACT" 2>/dev/null || true
-    NVDRV_SO=$(find "$NV_EXTRACT" -name "nvidia_drv.so" 2>/dev/null | head -1 || true)
-    if [ -n "$NVDRV_SO" ]; then
-        mkdir -p /usr/lib/xorg/modules/drivers
-        cp -f "$NVDRV_SO" /usr/lib/xorg/modules/drivers/nvidia_drv.so
-        log "nvidia_drv.so installed (not used by modesetting but available)"
-    fi
-    rm -rf "$NV_EXTRACT"
-fi
-rm -rf "$NV_DDX_STAGE"
-
-###############################################################################
-hdr "4 — NVENC"
-###############################################################################
 LINK_DIR="/usr/lib/x86_64-linux-gnu"
 NVENC_REAL=""
 for sd in "$LINK_DIR" /usr/local/nvidia/lib64 /usr/lib64 /usr/local/lib; do
@@ -172,9 +138,9 @@ for sd in "$LINK_DIR" /usr/local/nvidia/lib64 /usr/lib64 /usr/local/lib; do
     [ -n "$c" ] && { NVENC_REAL="$c"; break; }
 done
 if [ -n "$NVENC_REAL" ]; then
-    ln -sf "$NVENC_REAL"                        "${LINK_DIR}/libnvidia-encode.so.1" 2>/dev/null \
-        || cp -f "$NVENC_REAL"                  "${LINK_DIR}/libnvidia-encode.so.1"
-    ln -sf "${LINK_DIR}/libnvidia-encode.so.1"  "${LINK_DIR}/libnvidia-encode.so"
+    ln -sf "$NVENC_REAL"                       "${LINK_DIR}/libnvidia-encode.so.1" 2>/dev/null \
+        || cp -f "$NVENC_REAL"                 "${LINK_DIR}/libnvidia-encode.so.1"
+    ln -sf "${LINK_DIR}/libnvidia-encode.so.1" "${LINK_DIR}/libnvidia-encode.so"
     printf '%s\n' "$LINK_DIR" "$(dirname "$NVENC_REAL")" > /etc/ld.so.conf.d/nvenc.conf
     ldconfig
     log "NVENC → $NVENC_REAL"
@@ -186,84 +152,41 @@ CUDA_REAL=$(find "$LINK_DIR" /usr/local/nvidia/lib64 /usr/lib64 \
 [ -n "$CUDA_REAL" ] && { ln -sf "$CUDA_REAL" "${LINK_DIR}/libcuda.so.1" 2>/dev/null || true; ldconfig; log "libcuda.so.1 linked"; }
 
 ###############################################################################
-hdr "5 — XORG"
+hdr "5 — SUNSHINE (binary extraction only — no dpkg -i)"
 ###############################################################################
-XORG_BIN=$(command -v Xorg 2>/dev/null || find /usr/lib/xorg /usr/bin -name Xorg -type f 2>/dev/null | head -1 || true)
-[ -z "$XORG_BIN" ] && { err "Xorg binary not found"; exit 1; }
-log "Xorg: $XORG_BIN"
+# Never run dpkg -i sunshine.deb again — it has unresolvable deps (libmfx1/Intel)
+# and will re-poison apt. Extract binary + libs only.
+SUN_BIN=$(command -v sunshine 2>/dev/null \
+    || find /usr/bin /usr/local/bin -name sunshine -type f 2>/dev/null | head -1 || true)
 
-# v9: modesetting driver — bypasses NVIDIA DDX kernel module init failure entirely.
-# Sunshine x11 capture works fine with modesetting. adapter_name uses detected render node.
-mkdir -p /etc/X11
-cat > /etc/X11/xorg.conf << XORGEOF
-Section "ServerLayout"
-    Identifier     "Layout0"
-    Screen      0  "Screen0"
-    Option         "BlankTime"   "0"
-    Option         "StandbyTime" "0"
-    Option         "SuspendTime" "0"
-    Option         "OffTime"     "0"
-EndSection
-
-Section "Monitor"
-    Identifier     "Monitor0"
-    HorizSync       30-700
-    VertRefresh     50-${RES_HZ}
-    Modeline       "${RES_W}x${RES_H}_${RES_HZ}" 1829.25 ${RES_W} 3888 3920 4000 ${RES_H} 2163 2168 2235 +hsync -vsync
-    Option         "DPMS" "false"
-EndSection
-
-Section "Device"
-    Identifier     "Device0"
-    Driver         "modesetting"
-    Option         "kmsdev"   "${DRI_CARD}"
-    BusID          "${GPU_BUSID}"
-    Option         "AccelMethod" "none"
-EndSection
-
-Section "Screen"
-    Identifier     "Screen0"
-    Device         "Device0"
-    Monitor        "Monitor0"
-    DefaultDepth    24
-    SubSection     "Display"
-        Depth       24
-        Modes      "${RES_W}x${RES_H}_${RES_HZ}" "${RES_W}x${RES_H}" "2560x1440" "1920x1080"
-    EndSubSection
-EndSection
-XORGEOF
-log "xorg.conf written (modesetting, kmsdev=${DRI_CARD}, BusID=${GPU_BUSID})"
-
-###############################################################################
-hdr "6 — SUNSHINE (staged extraction — does NOT touch /bin or /usr/bin)"
-###############################################################################
-if ! command -v sunshine &>/dev/null; then
-    log "Downloading Sunshine..."
+if [ -z "$SUN_BIN" ]; then
+    log "Downloading Sunshine deb for binary extraction..."
     SUN_URL="https://github.com/LizardByte/Sunshine/releases/download/v0.23.1/sunshine-ubuntu-22.04-amd64.deb"
     curl -fsSL "$SUN_URL" -o /tmp/sunshine.deb || { err "Sunshine download failed"; exit 1; }
 
-    if dpkg -i /tmp/sunshine.deb 2>/dev/null; then
-        log "Sunshine installed via dpkg"
-    else
-        warn "dpkg EXDEV — using staged extraction"
-        SUN_STAGE=$(mktemp -d /tmp/sun-stage-XXXXXX)
-        dpkg-deb -x /tmp/sunshine.deb "$SUN_STAGE"
-        [ -f "${SUN_STAGE}/usr/bin/sunshine" ]    && cp -f "${SUN_STAGE}/usr/bin/sunshine"    /usr/bin/sunshine
-        [ -d "${SUN_STAGE}/usr/lib/sunshine" ]    && { mkdir -p /usr/lib/sunshine; cp -a "${SUN_STAGE}/usr/lib/sunshine/." /usr/lib/sunshine/; }
-        [ -d "${SUN_STAGE}/usr/share/sunshine" ]  && { mkdir -p /usr/share/sunshine; cp -a "${SUN_STAGE}/usr/share/sunshine/." /usr/share/sunshine/; }
-        [ -d "${SUN_STAGE}/etc/sunshine" ]        && { mkdir -p /etc/sunshine; cp -a "${SUN_STAGE}/etc/sunshine/." /etc/sunshine/; }
-        rm -rf "$SUN_STAGE"
-        ldconfig 2>/dev/null || true
-        log "Sunshine installed via staged extraction"
-    fi
-    rm -f /tmp/sunshine.deb
+    SUN_STAGE=$(mktemp -d /tmp/sun-stage-XXXXXX)
+    dpkg-deb -x /tmp/sunshine.deb "$SUN_STAGE"
+    [ -f "${SUN_STAGE}/usr/bin/sunshine" ]   && cp -f "${SUN_STAGE}/usr/bin/sunshine"   /usr/bin/sunshine
+    [ -d "${SUN_STAGE}/usr/lib/sunshine" ]   && { mkdir -p /usr/lib/sunshine; cp -a "${SUN_STAGE}/usr/lib/sunshine/." /usr/lib/sunshine/; }
+    [ -d "${SUN_STAGE}/usr/share/sunshine" ] && { mkdir -p /usr/share/sunshine; cp -a "${SUN_STAGE}/usr/share/sunshine/." /usr/share/sunshine/; }
+    [ -d "${SUN_STAGE}/etc/sunshine" ]       && { mkdir -p /etc/sunshine; cp -a "${SUN_STAGE}/etc/sunshine/." /etc/sunshine/; }
+    rm -rf "$SUN_STAGE" /tmp/sunshine.deb
+    ldconfig 2>/dev/null || true
+    log "Sunshine extracted"
+else
+    log "Sunshine already present: $SUN_BIN"
 fi
 
 SUN_BIN=$(command -v sunshine 2>/dev/null \
     || find /usr/bin /usr/local/bin -name sunshine -type f 2>/dev/null | head -1 || true)
-[ -z "$SUN_BIN" ] && { err "sunshine binary not found after install"; exit 1; }
-chmod +x "$SUN_BIN" 2>/dev/null || true
-log "Sunshine: $SUN_BIN"
+[ -z "$SUN_BIN" ] && { err "sunshine binary not found"; exit 1; }
+chmod +x "$SUN_BIN"
+
+# Verify the libayatana dep is actually satisfied now
+if ! ldd "$SUN_BIN" 2>/dev/null | grep -q "libayatana"; then
+    AYATANA_SO=$(ldconfig -p 2>/dev/null | grep libayatana-appindicator3 | awk '{print $NF}' | head -1 || true)
+    [ -n "$AYATANA_SO" ] && log "libayatana found: $AYATANA_SO" || warn "libayatana NOT in ldconfig — sunshine will crash"
+fi
 
 mkdir -p /root/.config/sunshine
 cat > /root/.config/sunshine/sunshine.conf << SUNEOF
@@ -288,7 +211,7 @@ SUNEOF
 log "Sunshine configured (adapter_name=${DRI_RENDER})"
 
 ###############################################################################
-hdr "7 — GAME ASSETS"
+hdr "6 — GAME ASSETS"
 ###############################################################################
 mkdir -p "$FERAL_SAVES" "$FERAL_PACKS" "${PROTON_BASE}/save_games" "${PROTON_BASE}/pack"
 SC=0; PC=0
@@ -305,7 +228,7 @@ done < <(find /workspace -maxdepth 4 -name "*.pack" -print0 2>/dev/null)
 log "Assets: $SC .save  $PC .pack"
 
 ###############################################################################
-hdr "8 — B2 SYNC"
+hdr "7 — B2 SYNC"
 ###############################################################################
 if [ -n "$B2_KEY_ID" ] && [ -n "$B2_APP_KEY" ]; then
     command -v rclone &>/dev/null || curl -fsSL https://rclone.org/install.sh | bash 2>/dev/null || true
@@ -325,7 +248,7 @@ RCONF
     cat > /usr/local/bin/b2-sync.sh << SYNCEOF
 #!/usr/bin/env bash
 rclone sync "${FERAL_SAVES}/" "b2funfun:${B2_BUCKET}/saves/" --log-file="${LOG_DIR}/b2.log"
-rclone sync "${FERAL_PACKS}/" "b2funfun:${B2_BUCKET}/packs/" --log-file="${LOG_DIR}/b2.log"
+rclone sync "${FERAL_PACKS}/" "b2funfun:${B2_BUCKET}/packs/'" --log-file="${LOG_DIR}/b2.log"
 SYNCEOF
     chmod +x /usr/local/bin/b2-sync.sh
     (crontab -l 2>/dev/null; echo "*/15 * * * * /usr/local/bin/b2-sync.sh") | sort -u | crontab - 2>/dev/null || true
@@ -335,7 +258,7 @@ else
 fi
 
 ###############################################################################
-hdr "9 — PULSEAUDIO"
+hdr "8 — PULSEAUDIO"
 ###############################################################################
 pulseaudio --daemonize --exit-idle-time=-1 2>/dev/null || true
 sleep 1
@@ -344,13 +267,17 @@ pactl set-default-sink virtual_out 2>/dev/null || true
 log "PulseAudio virtual sink ready"
 
 ###############################################################################
-hdr "10 — SUPERVISOR"
+hdr "9 — SUPERVISOR"
 ###############################################################################
 pkill -x supervisord 2>/dev/null || true; sleep 1
-pkill -x Xorg        2>/dev/null || true
+pkill -f Xvfb        2>/dev/null || true
 pkill -f sunshine    2>/dev/null || true
 
 mkdir -p /run/user/0; chmod 700 /run/user/0
+
+XVFB_BIN=$(command -v Xvfb 2>/dev/null || find /usr/bin -name Xvfb 2>/dev/null | head -1 || true)
+[ -z "$XVFB_BIN" ] && { err "Xvfb not found"; exit 1; }
+log "Xvfb: $XVFB_BIN"
 
 cat > /etc/supervisor/supervisord.conf << SUPCONF
 [supervisord]
@@ -386,17 +313,18 @@ stderr_logfile=/workspace/gaming-logs/pulse.log
 environment=HOME="/root"
 EOF
 
-cat > /etc/supervisor/conf.d/xorg.conf << XSEOF
-[program:xorg]
-command=${XORG_BIN} :${DISPLAY_NUM} -noreset +extension GLX +extension RANDR -config /etc/X11/xorg.conf -logfile ${LOG_DIR}/Xorg.${DISPLAY_NUM}.log
+# Xvfb: virtual framebuffer — no DRI, no KMS, no permission issues
+cat > /etc/supervisor/conf.d/xvfb.conf << XVEOF
+[program:xvfb]
+command=${XVFB_BIN} :${DISPLAY_NUM} -screen 0 ${RES_W}x${RES_H}x24 -ac +extension GLX +extension RANDR -noreset
 autorestart=true
 startretries=10
 startsecs=3
 priority=10
-stdout_logfile=${LOG_DIR}/xorg.log
-stderr_logfile=${LOG_DIR}/xorg.log
+stdout_logfile=${LOG_DIR}/xvfb.log
+stderr_logfile=${LOG_DIR}/xvfb.log
 environment=HOME="/root"
-XSEOF
+XVEOF
 
 cat > /etc/supervisor/conf.d/openbox.conf << OBSEOF
 [program:openbox]
@@ -423,7 +351,7 @@ environment=DISPLAY=":${DISPLAY_NUM}",HOME="/root",XDG_RUNTIME_DIR="/run/user/0"
 SSEOF
 
 ###############################################################################
-hdr "11 — LAUNCH"
+hdr "10 — LAUNCH"
 ###############################################################################
 nohup "$SUPD" -c /etc/supervisor/supervisord.conf >> "${LOG_DIR}/supervisord-boot.log" 2>&1 &
 disown
@@ -433,16 +361,16 @@ sleep 20
 supervisorctl -c /etc/supervisor/supervisord.conf status 2>/dev/null | sed 's/^/  /' || warn "supervisorctl not responding yet"
 
 ###############################################################################
-hdr "12 — VERIFY"
+hdr "11 — VERIFY"
 ###############################################################################
 PASS=0; FAIL=0
 chk() { [ "$1" = ok ] && { printf "  [OK] %s\n" "$2"; ((PASS++)); } || { printf "  [!!] %s\n" "$2"; ((FAIL++)); }; }
 
 pgrep -x sshd    &>/dev/null && chk ok "SSHD"        || chk fail "SSHD"
-xdpyinfo -display ":${DISPLAY_NUM}" &>/dev/null      && chk ok  "Xorg :${DISPLAY_NUM}" || chk fail "Xorg :${DISPLAY_NUM} — check ${LOG_DIR}/Xorg.${DISPLAY_NUM}.log"
-ldconfig -p 2>/dev/null | grep -q libnvidia-encode   && chk ok  "NVENC in ldconfig"    || chk fail "NVENC not in ldconfig"
-[ -c "${DRI_RENDER}" ]                               && chk ok  "${DRI_RENDER}"        || chk fail "${DRI_RENDER} missing"
-pgrep -f sunshine &>/dev/null                        && chk ok  "Sunshine"             || chk fail "Sunshine — check ${LOG_DIR}/sunshine.log"
+xdpyinfo -display ":${DISPLAY_NUM}" &>/dev/null      && chk ok  "Xvfb :${DISPLAY_NUM}"  || chk fail "Xvfb :${DISPLAY_NUM} — check ${LOG_DIR}/xvfb.log"
+ldconfig -p 2>/dev/null | grep -q libnvidia-encode   && chk ok  "NVENC in ldconfig"     || chk fail "NVENC not in ldconfig"
+ldconfig -p 2>/dev/null | grep -q libayatana          && chk ok  "libayatana present"    || chk fail "libayatana MISSING — sunshine will crash"
+pgrep -f sunshine &>/dev/null                        && chk ok  "Sunshine running"      || chk fail "Sunshine — check ${LOG_DIR}/sunshine.log"
 echo "  GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | head -1)"
 echo ""
 echo "  Result: ${PASS} passed / ${FAIL} failed"
@@ -450,7 +378,7 @@ echo "  Result: ${PASS} passed / ${FAIL} failed"
 ###############################################################################
 echo ""
 echo "==========================================="
-echo " RunPod Gaming Rig v9 — ${SECONDS}s"
+echo " RunPod Gaming Rig v10 — ${SECONDS}s"
 echo "==========================================="
 echo " SSH:  ssh root@${RUNPOD_HOST} -p ${RUNPOD_SSH_PORT}"
 echo " Pass: ${ROOT_PASS}"
@@ -468,7 +396,7 @@ echo " Web UI    → https://127.0.0.1:47990  (admin / gondolin123)"
 echo ""
 echo " supervisorctl -c /etc/supervisor/supervisord.conf status"
 echo " tail -f ${LOG_DIR}/sunshine.log"
-echo " tail -f ${LOG_DIR}/Xorg.${DISPLAY_NUM}.log"
+echo " tail -f ${LOG_DIR}/xvfb.log"
 echo "==========================================="
 
 if [ -n "${JUPYTER_TOKEN:-}" ] || [ -n "${JUPYTER_RUNTIME_DIR:-}" ] || [ -n "${JPY_PARENT_PID:-}" ]; then
