@@ -76,8 +76,6 @@ try {
     Write-Host ">> Pushing setup to ${ip}:${port}..."
     $PW64=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($PW))
 
-    # FIXED: literal here-string prevents PowerShell expanding $B2I/$B2K/$EMAIL inside bash
-    # Values injected via .Replace() tokens
     $bash=@'
 #!/bin/bash
 set -e
@@ -88,7 +86,7 @@ WS="/root/.local/share/unity3d/Owlcat Games/Pathfinder Wrath Of The Righteous/Sa
 WP="/root/.steam/steam/steamapps/compatdata/1184370/pfx/drive_c/users/steamuser/AppData/LocalLow/Owlcat Games/Pathfinder Wrath Of The Righteous/Saved Games"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq wget xvfb curl jq python3-pip rsync >/dev/null 2>&1
+apt-get install -y -qq wget xvfb curl jq rsync >/dev/null 2>&1
 command -v rclone &>/dev/null || (curl -fsSL https://rclone.org/install.sh | bash >/dev/null 2>&1) || true
 mkdir -p /root/.config/rclone
 cat > /root/.config/rclone/rclone.conf << 'REOF'
@@ -111,12 +109,23 @@ mkdir -p /root/.config/parsec
 rclone copyto b2:FunFun/parsec/config.cfg "$CFG" 2>/dev/null || true
 [ ! -f /usr/bin/parsecd ] && wget -q https://builds.parsec.app/package/parsec-linux.deb -O /tmp/p.deb && (dpkg -i /tmp/p.deb >/dev/null 2>&1 || apt-get install -f -y -qq >/dev/null 2>&1) || true
 if ! grep -q app_session_id "$CFG" 2>/dev/null; then
-  AUTH=$(curl -sf -X POST https://kessel-api.parsecgaming.com/v1/auth \
-    -H 'Content-Type: application/json' \
-    --data-raw "$(jq -n --arg e '__EMAIL__' --arg p "$PW" '{email:$e,password:$p,tfa:""}')")
-  SID=$(echo "$AUTH"|jq -r '.data.id // empty')
+  JSON=$(jq -n --arg e '__EMAIL__' --arg p "$PW" '{"email":$e,"password":$p,"tfa":""}')
+  AUTH=$(curl -sf -X POST https://kessel-api.parsec.app/v1/auth \
+    -H 'Content-Type: application/json' -d "$JSON" || \
+    curl -sf -X POST https://kessel-api.parsecgaming.com/v1/auth \
+    -H 'Content-Type: application/json' -d "$JSON")
+  TFA=$(echo "$AUTH" | jq -r '.data.tfa_required // false')
+  [ "$TFA" = "true" ] && echo "AUTH_FAILED: 2FA enabled on Parsec account" >&2 && exit 1
+  SID=$(echo "$AUTH" | jq -r '.data.id // empty')
   [ -z "$SID" ] && echo "AUTH_FAILED: $AUTH" >&2 && exit 1
-  printf '{"app_host":1,"app_session_id":"%s"}' "$SID" > "$CFG"
+  cat > "$CFG" << PCFG
+app_host = 1
+app_session_id = ${SID}
+server_resolution_x = 1920
+server_resolution_y = 1080
+encoder_bitrate = 50
+encoder_fps = 60
+PCFG
 fi
 pkill Xvfb 2>/dev/null; pkill parsecd 2>/dev/null; sleep 1
 Xvfb :99 -screen 0 1920x1080x24 & sleep 3
@@ -127,7 +136,6 @@ rclone copyto "$CFG" b2:FunFun/parsec/config.cfg 2>/dev/null || true
 echo PARSEC_READY
 '@
     $bash = $bash.Replace('__PW64__', $PW64).Replace('__B2I__', $B2I).Replace('__B2K__', $B2K).Replace('__EMAIL__', $EMAIL)
-    # LF only — bash will reject CRLF
     $bashBytes = [Text.Encoding]::UTF8.GetBytes(($bash -replace "`r`n","`n"))
 
     $tmp="$env:TEMP\ff_$PID.sh"; $out="$env:TEMP\ffout_$PID.txt"; $err="$env:TEMP\fferr_$PID.txt"
@@ -139,7 +147,7 @@ echo PARSEC_READY
     Remove-Item $tmp -EA SilentlyContinue
     Write-Host "=== SSH STDOUT ===`n$res"
     Write-Host "=== SSH STDERR ===`n$er"
-    if($res -match "AUTH_FAILED"){throw "Parsec auth failed - check ParsecPW"}
+    if($res -match "AUTH_FAILED"){throw "Parsec auth failed: $res"}
     if($res -notmatch "PARSEC_READY"){Write-Host "!! PARSEC_READY not seen" -ForegroundColor Yellow}
     Write-Host ">> Launching Parsec..." -ForegroundColor Green
     Start-Process "C:\Program Files\Parsec\parsecd.exe"
