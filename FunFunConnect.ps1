@@ -48,7 +48,7 @@ try {
     }
     function SSH-Out($cmd) {
         $out = "$env:TEMP\sshout_$PID.txt"
-        $p = Start-Process ssh -ArgumentList ($SSH + $cmd) -NoNewWindow -Wait -PassThru -RedirectStandardOutput $out
+        Start-Process ssh -ArgumentList ($SSH + $cmd) -NoNewWindow -Wait -PassThru -RedirectStandardOutput $out | Out-Null
         $r = Get-Content $out -Raw -EA SilentlyContinue
         Remove-Item $out -EA SilentlyContinue
         return $r
@@ -120,9 +120,10 @@ rclone copyto b2:FunFun/parsec/config.cfg "$CFG" 2>/dev/null || true
 if ! grep -q app_session_id "$CFG" 2>/dev/null; then
   echo "Authenticating Parsec..."
   JSON=$(jq -n --arg e '__EMAIL__' --arg p "$PW" '{"email":$e,"password":$p,"tfa":""}')
-  AUTH=$(curl -sf -X POST https://kessel-api.parsec.app/v1/auth \
-    -H 'Content-Type: application/json' -d "$JSON") || \
-  AUTH=$(curl -sf -X POST https://kessel-api.parsecgaming.com/v1/auth \
+  echo "Sending auth request..."
+  AUTH=$(curl -s -X POST https://kessel-api.parsec.app/v1/auth \
+    -H 'Content-Type: application/json' -d "$JSON") || AUTH=""
+  [ -z "$AUTH" ] && AUTH=$(curl -s -X POST https://kessel-api.parsecgaming.com/v1/auth \
     -H 'Content-Type: application/json' -d "$JSON") || true
   echo "Auth response: $AUTH"
   TFA=$(echo "$AUTH" | jq -r '.data.tfa_required // false' 2>/dev/null || echo false)
@@ -138,6 +139,7 @@ encoder_bitrate = 50
 encoder_fps = 60
 PCFG
   echo "Config written."
+  rclone copyto "$CFG" b2:FunFun/parsec/config.cfg 2>/dev/null || true
 fi
 echo "Launching Parsec..."
 pkill Xvfb 2>/dev/null || true; pkill parsecd 2>/dev/null || true; sleep 1
@@ -148,7 +150,6 @@ sleep 15
 ps aux | grep -E 'parsecd|Xvfb' | grep -v grep
 (while true; do sleep 300; rclone sync "$WS/" b2:FunFun/wotr/saves/ 2>/dev/null||true; done) &
 disown
-rclone copyto "$CFG" b2:FunFun/parsec/config.cfg 2>/dev/null || true
 echo "=== PARSEC_READY ==="
 '@
     $bash = $bash.Replace('__PW64__', $PW64).Replace('__B2I__', $B2I).Replace('__B2K__', $B2K).Replace('__EMAIL__', $EMAIL)
