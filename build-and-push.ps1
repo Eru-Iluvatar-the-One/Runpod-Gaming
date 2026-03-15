@@ -1,9 +1,9 @@
 # build-and-push.ps1 — Run this ONCE locally to build and push the Docker image.
 # Requires Docker Desktop running on Windows.
-# Usage: .\build-and-push.ps1 -Tag <<<DOCKERHUB_USERNAME>>>/funfunpod:latest
+# Usage: .\build-and-push.ps1
 
 param(
-    [string]$Tag = "<<<DOCKERHUB_USERNAME>>>/funfunpod:latest"
+    [string]$Tag = "eruilu/funfunpod:latest"
 )
 
 $ErrorActionPreference = "Stop"

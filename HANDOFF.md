@@ -27,7 +27,7 @@
 
 ## RunPod Pod Settings
 
-- Container image: `<<<DOCKERHUB_USERNAME>>>/funfunpod:latest`
+- Container image: `eruilu/funfunpod:latest`
 - Expose port: `8080` as HTTP
 - Network volume: attached, mounted at `/workspace`
 - GPU: RTX 4000 Ada / A4000 or better (NVENC required)
